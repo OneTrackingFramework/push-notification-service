@@ -6,11 +6,11 @@ use std::error::Error;
 extern crate diesel;
 extern crate dotenv;
 
-use std::env;
-use diesel::prelude::*;
-use diesel::pg::PgConnection;
-use dotenv::dotenv;
 use db::models::*;
+use diesel::pg::PgConnection;
+use diesel::prelude::*;
+use dotenv::dotenv;
+use std::env;
 
 fn establish_connection() -> PgConnection {
     dotenv().ok();
@@ -26,7 +26,7 @@ impl Config {
         if args.len() < 1 {
             return Err("not enough arguments");
         }
-        Ok(Config{})
+        Ok(Config {})
     }
 }
 
@@ -34,7 +34,8 @@ pub fn run(_config: Config) -> Result<(), Box<dyn Error>> {
     use db::schema::pdevicetype::dsl::*;
 
     let connection = establish_connection();
-    let results = pdevicetype.limit(5)
+    let results = pdevicetype
+        .limit(5)
         .load::<DeviceType>(&connection)
         .expect("Error loading user");
 

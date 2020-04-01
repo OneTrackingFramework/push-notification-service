@@ -24,8 +24,4 @@ table! {
 joinable!(pdevice -> pdevicetype (devicetypeid));
 joinable!(puser -> pdevice (deviceid));
 
-allow_tables_to_appear_in_same_query!(
-    pdevice,
-    pdevicetype,
-    puser,
-);
+allow_tables_to_appear_in_same_query!(pdevice, pdevicetype, puser,);
