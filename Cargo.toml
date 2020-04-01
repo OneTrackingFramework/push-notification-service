@@ -1,5 +1,5 @@
 [package]
-name = "push-notification-service"
+name = "pushy"
 version = "0.1.0"
 authors = ["Florian <7901907+mrRo8o7@users.noreply.github.com>"]
 edition = "2018"
