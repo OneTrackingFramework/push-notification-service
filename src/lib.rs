@@ -6,6 +6,10 @@ extern crate env_logger;
 extern crate diesel;
 extern crate dotenv;
 
+extern crate kafka;
+#[macro_use]
+extern crate error_chain;
+
 mod db;
 mod messaging;
 
@@ -19,6 +23,9 @@ use diesel::prelude::*;
 use messaging::firebase::*;
 
 use futures::executor;
+
+use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
+use std::time::Duration;
 
 fn establish_connection() -> PgConnection {
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -128,19 +135,67 @@ pub fn send_messages_to_user<'a>(
 }
 
 pub fn run(_config: Config) -> Result<(), Box<dyn Error>> {
-    use db::schema::pdevicetype::dsl::*;
-
     let connection = establish_connection();
-    let results = pdevicetype
-        .limit(5)
-        .load::<DeviceType>(&connection)
-        .expect("Error loading user");
 
-    for r in results {
-        println!("{:?}", r);
+    macro_rules! required_list {
+        ($name:expr) => {{
+            let opt: Vec<String> = $name
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if opt.is_empty() {
+                bail!(format!("Invalid --{:?} specified!", opt));
+            }
+            opt
+        }};
+    };
+
+    let topics = required_list!(env::var("KAFKA_TOPICS").expect("KAFKA_TOPICS must be set"));
+    let brokers = required_list!(env::var("KAFKA_BROKERS").expect("KAFKA_BROKERS must be set"));
+    let group = env::var("KAFKA_GROUP").expect("KAFKA_GROUP must be set");
+    let mut fallback_offset = FetchOffset::Latest;
+    if let Ok(_) = env::var("KAFKA_FALLBACK_OFFSET") {
+        fallback_offset = FetchOffset::Earliest;
+    };
+    let storage = env::var("KAFKA_OFFSET_STORAGE").expect("KAFKA_OFFSET_STORAGE must be set");
+    let mut offset_storage = GroupOffsetStorage::Kafka;
+    if storage.eq_ignore_ascii_case("zookeeper") {
+        offset_storage = GroupOffsetStorage::Zookeeper;
+    } else {
+        bail!(format!("Unknown offset store: {}", storage));
     }
+    let fetch_max_wait_time =
+        env::var("KAFKA_FETCH_MAX_WAIT_TIME").expect("KAFKA_FETCH_MAX_WAIT_TIME must be set");
+    let fetch_min_bytes =
+        env::var("KAFKA_FETCH_MIN_BYTES").expect("KAFKA_FETCH_MIN_BYTES must be set");
+    let fetch_max_bytes_per_partition = env::var("KAFKA_FETCH_MAX_BYTES_PER_PARTITION")
+        .expect("KAFKA_FETCH_MAX_BYTES_PER_PARTITION must be set");
+    let retry_max_bytes_limit =
+        env::var("KAFKA_RETRY_MAX_BYTES_LIMIT").expect("KAFKA_RETRY_MAX_BYTES_LIMIT must be set");
+
+    let mut c = {
+        let mut cb = Consumer::from_hosts(brokers)
+            .with_group(group)
+            .with_fallback_offset(fallback_offset)
+            .with_fetch_max_wait_time(Duration::from_secs(
+                u64::from_str_radix(&fetch_max_wait_time, 10).unwrap(),
+            ))
+            .with_fetch_min_bytes(i32::from_str_radix(&fetch_min_bytes, 10).unwrap())
+            .with_fetch_max_bytes_per_partition(
+                i32::from_str_radix(&fetch_max_bytes_per_partition, 10).unwrap(),
+            )
+            .with_retry_max_bytes_limit(i32::from_str_radix(&retry_max_bytes_limit, 10).unwrap())
+            .with_offset_storage(offset_storage)
+            .with_client_id("kafka-pushy-consumer".into());
+        for topic in topics {
+            cb = cb.with_topic(topic);
+        }
+        cb.create()?
+    };
 
     create_user_device_mapping(&connection, "Max", "MaxTOKEN", DeviceTypeName::IOS);
+    send_messages_to_user(&connection, "Max", "Hallo", "Welt");
     delete_user_device_mapping(&connection, "MaxTOKEN");
 
     info!("Shutting down");
