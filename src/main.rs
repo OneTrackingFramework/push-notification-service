@@ -1,9 +1,9 @@
-extern crate log;
 extern crate env_logger;
+extern crate log;
 
+use dotenv::dotenv;
 use std::env;
 use std::process;
-use dotenv::dotenv;
 
 use pushy::*;
 

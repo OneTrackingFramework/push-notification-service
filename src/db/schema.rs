@@ -1,12 +1,4 @@
 table! {
-    pdevice (id) {
-        id -> Int4,
-        devicetypeid -> Int4,
-        token -> Varchar,
-    }
-}
-
-table! {
     pdevicetype (id) {
         id -> Int4,
         name -> Varchar,
@@ -16,12 +8,12 @@ table! {
 table! {
     puser (id) {
         id -> Int4,
-        userid -> Varchar,
-        deviceid -> Int4,
+        user_id -> Varchar,
+        device_type_id -> Int4,
+        token -> Varchar,
     }
 }
 
-joinable!(pdevice -> pdevicetype (devicetypeid));
-joinable!(puser -> pdevice (deviceid));
+joinable!(puser -> pdevicetype (device_type_id));
 
-allow_tables_to_appear_in_same_query!(pdevice, pdevicetype, puser,);
+allow_tables_to_appear_in_same_query!(pdevicetype, puser,);
