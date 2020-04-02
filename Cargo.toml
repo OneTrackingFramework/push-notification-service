@@ -11,3 +11,6 @@ diesel = { version = "1.4.4", features = ["postgres"] }
 dotenv = "0.15.0"
 kafka = "0.8.0"
 fcm = "0.7.1"
+lazy_static = "1.4.0"
+log = "0.4.8"
+env_logger = "0.7.1"
