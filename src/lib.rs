@@ -34,6 +34,23 @@ fn establish_connection() -> PgConnection {
     connection
 }
 
+fn create_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
+        let mut cb = Consumer::from_hosts(config.brokers)
+            .with_group(config.group)
+            .with_fallback_offset(config.fallback_offset)
+            .with_fetch_max_wait_time(Duration::from_secs(config.fetch_max_wait_time))
+            .with_fetch_min_bytes(config.fetch_min_bytes)
+            .with_fetch_max_bytes_per_partition(config.fetch_max_bytes_per_partition)
+            .with_retry_max_bytes_limit(config.retry_max_bytes_limit)
+            .with_offset_storage(config.offset_storage)
+            .with_client_id("kafka-pushy-consumer".into());
+        for topic in config.topics {
+            cb = cb.with_topic(topic);
+        }
+        Ok(cb.create()?)
+}
+
+#[derive(Clone)]
 pub struct Config {
     fcm_api_key: String,
     topics: Vec<String>,
@@ -215,25 +232,11 @@ pub fn send_messages_to_user<'a>(
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let connection = establish_connection();
 
-    let mut c = {
-        let mut cb = Consumer::from_hosts(config.brokers)
-            .with_group(config.group)
-            .with_fallback_offset(config.fallback_offset)
-            .with_fetch_max_wait_time(Duration::from_secs(config.fetch_max_wait_time))
-            .with_fetch_min_bytes(config.fetch_min_bytes)
-            .with_fetch_max_bytes_per_partition(config.fetch_max_bytes_per_partition)
-            .with_retry_max_bytes_limit(config.retry_max_bytes_limit)
-            .with_offset_storage(config.offset_storage)
-            .with_client_id("kafka-pushy-consumer".into());
-        for topic in config.topics {
-            cb = cb.with_topic(topic);
-        }
-        cb.create()?
-    };
+    let mut consumer = create_consumer(config.clone())?;
 
-    create_user_device_mapping(&connection, "Max", "MaxTOKEN", DeviceTypeName::IOS);
+    create_user_device_mapping(&connection, "Max Mustermann", "13245", DeviceTypeName::IOS);
     //send_messages_to_user(&connection, &config.fcm_api_key, "Max", "Hallo", "Welt");
-    delete_user_device_mapping(&connection, "MaxTOKEN");
+    delete_user_device_mapping(&connection, "1234");
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -241,7 +244,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
 
     let do_commit = !config.no_commit;
     loop {
-        for ms in c.poll()?.iter() {
+        for ms in consumer.poll()?.iter() {
             for m in ms.messages() {
                 // ~ clear the output buffer
                 unsafe { buf.set_len(0) };
@@ -252,10 +255,10 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 // ~ write to output channel
                 stdout.write_all(&buf)?;
             }
-            let _ = c.consume_messageset(ms);
+            let _ = consumer.consume_messageset(ms);
         }
         if do_commit {
-            c.commit_consumed()?;
+            consumer.commit_consumed()?;
         }
     }
 

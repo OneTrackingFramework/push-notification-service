@@ -1,4 +1,3 @@
-use std::env;
 use std::error::Error;
 
 use lazy_static::lazy_static;
