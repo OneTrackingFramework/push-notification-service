@@ -7,13 +7,12 @@ extern crate diesel;
 extern crate dotenv;
 
 extern crate kafka;
-#[macro_use]
-extern crate error_chain;
 
 mod db;
 mod messaging;
 
 use std::env;
+use std::io::{self, Write};
 
 use std::error::Error;
 
@@ -35,14 +34,90 @@ fn establish_connection() -> PgConnection {
     connection
 }
 
-pub struct Config;
+pub struct Config {
+    fcm_api_key: String,
+    topics: Vec<String>,
+    brokers: Vec<String>,
+    group: String,
+    fallback_offset: FetchOffset,
+    offset_storage: GroupOffsetStorage,
+    fetch_max_wait_time: u64,
+    fetch_min_bytes: i32,
+    fetch_max_bytes_per_partition: i32,
+    retry_max_bytes_limit: i32,
+    no_commit: bool,
+}
 
 impl Config {
     pub fn new(args: &[String]) -> Result<Config, &'static str> {
         if args.len() < 1 {
             return Err("not enough arguments");
         }
-        Ok(Config {})
+        let fcm_api_key = env::var("FCM_API_KEY").expect("FCM_API_KEY must be set");
+        let topics: Vec<String> = env::var("KAFKA_TOPICS")
+            .expect("KAFKA_TOPICS must be set")
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let brokers: Vec<String> = env::var("KAFKA_BROKERS")
+            .expect("KAFKA_BROKERS must be set")
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let group = env::var("KAFKA_GROUP").expect("KAFKA_GROUP must be set");
+        let mut fallback_offset = FetchOffset::Latest;
+        if let Ok(_) = env::var("KAFKA_FALLBACK_OFFSET") {
+            fallback_offset = FetchOffset::Earliest;
+        };
+        let storage = env::var("KAFKA_OFFSET_STORAGE").expect("KAFKA_OFFSET_STORAGE must be set");
+        let mut offset_storage = GroupOffsetStorage::Kafka;
+        if storage.eq_ignore_ascii_case("zookeeper") {
+            offset_storage = GroupOffsetStorage::Zookeeper;
+        } else if !storage.eq_ignore_ascii_case("kafka") {
+            panic!(format!("Unknown offset store: {}", storage));
+        }
+        let fetch_max_wait_time = u64::from_str_radix(
+            &env::var("KAFKA_FETCH_MAX_WAIT_TIME").expect("KAFKA_FETCH_MAX_WAIT_TIME must be set"),
+            10,
+        )
+        .unwrap();
+        let fetch_min_bytes = i32::from_str_radix(
+            &env::var("KAFKA_FETCH_MIN_BYTES").expect("KAFKA_FETCH_MIN_BYTES must be set"),
+            10,
+        )
+        .unwrap();
+        let fetch_max_bytes_per_partition = i32::from_str_radix(
+            &env::var("KAFKA_FETCH_MAX_BYTES_PER_PARTITION")
+                .expect("KAFKA_FETCH_MAX_BYTES_PER_PARTITION must be set"),
+            10,
+        )
+        .unwrap();
+        let retry_max_bytes_limit = i32::from_str_radix(
+            &env::var("KAFKA_RETRY_MAX_BYTES_LIMIT")
+                .expect("KAFKA_RETRY_MAX_BYTES_LIMIT must be set"),
+            10,
+        )
+        .unwrap();
+        let commit = env::var("KAFKA_NO_COMMIT").expect("KAFKA_NO_COMMIT must be set");
+        let mut no_commit = false;
+        if commit.eq_ignore_ascii_case("TRUE") {
+            no_commit = true;
+        }
+        Ok(Config {
+            fcm_api_key,
+            topics,
+            brokers,
+            group,
+            fallback_offset,
+            offset_storage,
+            fetch_max_wait_time,
+            fetch_min_bytes,
+            fetch_max_bytes_per_partition,
+            retry_max_bytes_limit,
+            no_commit,
+        })
     }
 }
 
@@ -103,6 +178,7 @@ pub fn delete_user_device_mapping<'a>(connection: &PgConnection, delete_token: &
 
 pub fn send_messages_to_user<'a>(
     connection: &PgConnection,
+    fcm_api_key: &'a str,
     send_user_id: &'a str,
     title: &'a str,
     body: &'a str,
@@ -116,7 +192,9 @@ pub fn send_messages_to_user<'a>(
         for user in users {
             match &user.1.name[..] {
                 "FIREBASE" => {
-                    if let Err(e) = executor::block_on(send_message(&user.0.token, title, body)) {
+                    if let Err(e) =
+                        executor::block_on(send_message(fcm_api_key, &user.0.token, title, body))
+                    {
                         warn!("Could not execute send message future: {}", e);
                     }
                 }
@@ -134,69 +212,52 @@ pub fn send_messages_to_user<'a>(
     }
 }
 
-pub fn run(_config: Config) -> Result<(), Box<dyn Error>> {
+pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let connection = establish_connection();
 
-    macro_rules! required_list {
-        ($name:expr) => {{
-            let opt: Vec<String> = $name
-                .split(',')
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if opt.is_empty() {
-                bail!(format!("Invalid --{:?} specified!", opt));
-            }
-            opt
-        }};
-    };
-
-    let topics = required_list!(env::var("KAFKA_TOPICS").expect("KAFKA_TOPICS must be set"));
-    let brokers = required_list!(env::var("KAFKA_BROKERS").expect("KAFKA_BROKERS must be set"));
-    let group = env::var("KAFKA_GROUP").expect("KAFKA_GROUP must be set");
-    let mut fallback_offset = FetchOffset::Latest;
-    if let Ok(_) = env::var("KAFKA_FALLBACK_OFFSET") {
-        fallback_offset = FetchOffset::Earliest;
-    };
-    let storage = env::var("KAFKA_OFFSET_STORAGE").expect("KAFKA_OFFSET_STORAGE must be set");
-    let mut offset_storage = GroupOffsetStorage::Kafka;
-    if storage.eq_ignore_ascii_case("zookeeper") {
-        offset_storage = GroupOffsetStorage::Zookeeper;
-    } else {
-        bail!(format!("Unknown offset store: {}", storage));
-    }
-    let fetch_max_wait_time =
-        env::var("KAFKA_FETCH_MAX_WAIT_TIME").expect("KAFKA_FETCH_MAX_WAIT_TIME must be set");
-    let fetch_min_bytes =
-        env::var("KAFKA_FETCH_MIN_BYTES").expect("KAFKA_FETCH_MIN_BYTES must be set");
-    let fetch_max_bytes_per_partition = env::var("KAFKA_FETCH_MAX_BYTES_PER_PARTITION")
-        .expect("KAFKA_FETCH_MAX_BYTES_PER_PARTITION must be set");
-    let retry_max_bytes_limit =
-        env::var("KAFKA_RETRY_MAX_BYTES_LIMIT").expect("KAFKA_RETRY_MAX_BYTES_LIMIT must be set");
-
     let mut c = {
-        let mut cb = Consumer::from_hosts(brokers)
-            .with_group(group)
-            .with_fallback_offset(fallback_offset)
-            .with_fetch_max_wait_time(Duration::from_secs(
-                u64::from_str_radix(&fetch_max_wait_time, 10).unwrap(),
-            ))
-            .with_fetch_min_bytes(i32::from_str_radix(&fetch_min_bytes, 10).unwrap())
-            .with_fetch_max_bytes_per_partition(
-                i32::from_str_radix(&fetch_max_bytes_per_partition, 10).unwrap(),
-            )
-            .with_retry_max_bytes_limit(i32::from_str_radix(&retry_max_bytes_limit, 10).unwrap())
-            .with_offset_storage(offset_storage)
+        let mut cb = Consumer::from_hosts(config.brokers)
+            .with_group(config.group)
+            .with_fallback_offset(config.fallback_offset)
+            .with_fetch_max_wait_time(Duration::from_secs(config.fetch_max_wait_time))
+            .with_fetch_min_bytes(config.fetch_min_bytes)
+            .with_fetch_max_bytes_per_partition(config.fetch_max_bytes_per_partition)
+            .with_retry_max_bytes_limit(config.retry_max_bytes_limit)
+            .with_offset_storage(config.offset_storage)
             .with_client_id("kafka-pushy-consumer".into());
-        for topic in topics {
+        for topic in config.topics {
             cb = cb.with_topic(topic);
         }
         cb.create()?
     };
 
     create_user_device_mapping(&connection, "Max", "MaxTOKEN", DeviceTypeName::IOS);
-    send_messages_to_user(&connection, "Max", "Hallo", "Welt");
+    //send_messages_to_user(&connection, &config.fcm_api_key, "Max", "Hallo", "Welt");
     delete_user_device_mapping(&connection, "MaxTOKEN");
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    let mut buf = Vec::with_capacity(1024);
+
+    let do_commit = !config.no_commit;
+    loop {
+        for ms in c.poll()?.iter() {
+            for m in ms.messages() {
+                // ~ clear the output buffer
+                unsafe { buf.set_len(0) };
+                // ~ format the message for output
+                let _ = write!(buf, "{}:{}@{}:\n", ms.topic(), ms.partition(), m.offset);
+                buf.extend_from_slice(m.value);
+                buf.push(b'\n');
+                // ~ write to output channel
+                stdout.write_all(&buf)?;
+            }
+            let _ = c.consume_messageset(ms);
+        }
+        if do_commit {
+            c.commit_consumed()?;
+        }
+    }
 
     info!("Shutting down");
     Ok(())
