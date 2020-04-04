@@ -242,6 +242,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut stdout = stdout.lock();
     let mut buf = Vec::with_capacity(1024);
 
+    info!("Service started. Listening for events...");
     let do_commit = !config.no_commit;
     loop {
         for ms in consumer.poll()?.iter() {
