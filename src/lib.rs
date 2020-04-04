@@ -234,9 +234,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
 
     let mut consumer = create_consumer(config.clone())?;
 
-    create_user_device_mapping(&connection, "Max Mustermann", "13245", DeviceTypeName::IOS);
+    create_user_device_mapping(&connection, "Max Mustermann", "12345", DeviceTypeName::IOS);
     //send_messages_to_user(&connection, &config.fcm_api_key, "Max", "Hallo", "Welt");
-    delete_user_device_mapping(&connection, "1234");
+    delete_user_device_mapping(&connection, "12345");
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();

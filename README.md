@@ -13,5 +13,6 @@ This microservice is implemented for the One Tracking Framework, which was origi
 ```
 docker-compose up -d
 docker build -t pushy-image .
+docker run pushy-image pushy --network="host"
 ```
 Hint: dont forget to create to create db schema and kafka topics
