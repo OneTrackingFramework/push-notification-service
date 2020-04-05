@@ -39,7 +39,7 @@ fn establish_connection() -> PgConnection {
     connection
 }
 
-fn create_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
+fn create_kafka_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
     let mut cb = Consumer::from_hosts(config.brokers)
         .with_group(config.group)
         .with_fallback_offset(config.fallback_offset)
@@ -55,7 +55,7 @@ fn create_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
     Ok(cb.create()?)
 }
 
-fn create_producer(config: Config) -> Result<Producer, Box<dyn Error>> {
+fn create_kafka_producer(config: Config) -> Result<Producer, Box<dyn Error>> {
     Ok(Producer::from_hosts(config.brokers)
         .with_ack_timeout(Duration::from_secs(config.ack_timeout))
         .with_required_acks(RequiredAcks::One)
@@ -141,7 +141,8 @@ impl Config {
             10,
         )
         .unwrap();
-        let shutdown_topic = env::var("KAFKA_SHUTDOWN_TOPIC").expect("KAFKA_SHUTDOWN_TOPIC  must be set");
+        let shutdown_topic =
+            env::var("KAFKA_SHUTDOWN_TOPIC").expect("KAFKA_SHUTDOWN_TOPIC  must be set");
         Ok(Config {
             fcm_api_key,
             topics,
@@ -198,7 +199,7 @@ pub fn create_user_device_mapping<'a>(
                 "Could not create user / device mapping: {:?}, message: {}",
                 new_user, e
             ),
-            Ok(created_user) => info!("Created user / device mapping: {:?}", created_user),
+            Ok(created_user) => debug!("Created user / device mapping: {:?}", created_user),
         }
     } else {
         warn!("Could not create mapping for user: {}, b/c could not retrieve id for device type: {:?}", new_user_id, dtype_name);
@@ -209,7 +210,7 @@ pub fn delete_user_device_mapping<'a>(connection: &PgConnection, delete_token: &
     use db::schema::puser::dsl::*;
 
     if let Ok(_) = diesel::delete(puser.filter(token.eq(delete_token))).execute(connection) {
-        info!("Deleted user / device mapping for token: {}", delete_token);
+        debug!("Deleted user / device mapping for token: {}", delete_token);
     } else {
         warn! {"Could not delete user / device mapping for token: {}", delete_token};
     }
@@ -254,8 +255,8 @@ pub fn send_messages_to_user<'a>(
 pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
     let connection = establish_connection();
 
-    let mut consumer = create_consumer(config.clone())?;
-    let mut producer = create_producer(config.clone())?;
+    let mut consumer = create_kafka_consumer(config.clone())?;
+    let mut producer = create_kafka_producer(config.clone())?;
 
     let producer_config = config.clone();
 
@@ -270,7 +271,6 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
 
         info!("Service started. Listening for events...");
 
-        let do_commit = !config.no_commit;
         'kafka_msg_cycle: loop {
             for ms in consumer
                 .poll()
@@ -278,9 +278,11 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                 .iter()
             {
                 if ms.topic() == config.shutdown_topic {
-                    consumer
-                        .commit_consumed()
-                        .expect("Failed to commit consumed message");
+                    if !config.no_commit {
+                        consumer
+                            .commit_consumed()
+                            .expect("Failed to commit consumed message");
+                    }
                     break 'kafka_msg_cycle;
                 }
                 for m in ms.messages() {
@@ -297,7 +299,7 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                 }
                 let _ = consumer.consume_messageset(ms);
             }
-            if do_commit {
+            if !config.no_commit {
                 consumer
                     .commit_consumed()
                     .expect("Failed to commit consumed message");
@@ -310,8 +312,13 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
     }
     info!("Shutting down");
 
-    producer.send(&Record::from_value(&producer_config.shutdown_topic, "".as_bytes())).unwrap();
-   
+    producer
+        .send(&Record::from_value(
+            &producer_config.shutdown_topic,
+            "".as_bytes(),
+        ))
+        .unwrap();
+
     kafka_thread.join().expect("Could not join Kafka thread");
 
     Ok(())
