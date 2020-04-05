@@ -18,7 +18,7 @@ use std::env;
 use std::error::Error;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex
 };
 use std::time::Duration;
 
@@ -159,8 +159,8 @@ pub enum DeviceTypeName {
     FIREBASE, // Can be Android and iOS
 }
 
-pub fn create_user_device_mapping<'a>(
-    connection: &PgConnection,
+pub async fn create_user_device_mapping<'a>(
+    connection: Arc<Mutex<PgConnection>>,
     new_user_id: &'a str,
     new_token: &'a str,
     dtype_name: DeviceTypeName,
@@ -174,7 +174,7 @@ pub fn create_user_device_mapping<'a>(
             DeviceTypeName::IOS => "IOS",
         }))
         .limit(1)
-        .load::<DeviceType>(connection)
+        .load::<DeviceType>(&*connection.lock().unwrap())
     {
         let new_devicetype = &new_devicetype[0]; // B/c limit(1)
 
@@ -185,7 +185,7 @@ pub fn create_user_device_mapping<'a>(
         };
         match diesel::insert_into(puser)
             .values(&new_user)
-            .get_result::<User>(connection)
+            .get_result::<User>(&*connection.lock().unwrap())
         {
             Err(e) => warn!(
                 "Could not create user / device mapping: {:?}, message: {}",
@@ -198,18 +198,18 @@ pub fn create_user_device_mapping<'a>(
     }
 }
 
-pub fn delete_user_device_mapping<'a>(connection: &PgConnection, delete_token: &'a str) {
+pub async fn delete_user_device_mapping<'a>(connection: Arc<Mutex<PgConnection>>, delete_token: &'a str) {
     use db::schema::puser::dsl::*;
 
-    if let Ok(_) = diesel::delete(puser.filter(token.eq(delete_token))).execute(connection) {
+    if let Ok(_) = diesel::delete(puser.filter(token.eq(delete_token))).execute(&*connection.lock().unwrap()) {
         debug!("Deleted user / device mapping for token: {}", delete_token);
     } else {
         warn! {"Could not delete user / device mapping for token: {}", delete_token};
     }
 }
 
-pub fn send_messages_to_user<'a>(
-    connection: &PgConnection,
+pub async fn send_messages_to_user<'a>(
+    connection: Arc<Mutex<PgConnection>>,
     fcm_api_key: &'a str,
     send_user_id: &'a str,
     title: &'a str,
@@ -219,13 +219,13 @@ pub fn send_messages_to_user<'a>(
     let users: Result<Vec<(User, DeviceType)>, diesel::result::Error> = db::schema::puser::table
         .inner_join(db::schema::pdevicetype::table)
         .filter(user_id.eq(send_user_id))
-        .load(connection);
+        .load(&*connection.lock().unwrap());
     if let Ok(users) = users {
         for user in users {
             match &user.1.name[..] {
                 "FIREBASE" => {
                     if let Err(e) =
-                        executor::block_on(send_message(fcm_api_key, &user.0.token, title, body))
+                        send_message(fcm_api_key, &user.0.token, title, body).await
                     {
                         warn!("Could not execute send message future: {}", e);
                     }
@@ -245,17 +245,13 @@ pub fn send_messages_to_user<'a>(
 }
 
 pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
-    let connection = establish_connection();
+    let connection = Arc::new(Mutex::new(establish_connection()));
 
     // Do db migrations
-    embedded_migrations::run(&connection)?;
+    embedded_migrations::run(&*connection.lock().unwrap())?;
     info!("Database migrations completed");
 
     let mut consumer = create_kafka_consumer(config.clone()).unwrap();
-
-    create_user_device_mapping(&connection, "Max Mustermann", "12345", DeviceTypeName::IOS);
-    //send_messages_to_user(&connection, &config.fcm_api_key, "Max", "Hallo", "Welt");
-    delete_user_device_mapping(&connection, "12345");
 
     // let stdout = io::stdout();
     // let mut stdout = stdout.lock();
@@ -272,7 +268,11 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
             .iter()
         {
             for m in ms.messages() {
+                let connection = connection.clone();
                 pool.execute(move || {
+                    create_user_device_mapping(connection.clone(), "Max Mustermann", "12345", DeviceTypeName::IOS);
+                    //send_messages_to_user(connection, &config.fcm_api_key, "Max", "Hallo", "Welt");
+                    delete_user_device_mapping(connection, "12345");
 
                     /*
                     // ~ clear the output buffer
