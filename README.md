@@ -8,11 +8,15 @@ Microservice written in Rust to send push notifications to clients (e.g. iOS / A
   
 This microservice is implemented for the One Tracking Framework, which was originally developed by the #wirvsvirus-Hackaton. The goal is to curb the Covid-19 disease.
 
-## Run with Docker
+## Test with environment from docker
+```
+docker-compose up -d # setup environment
+RUST_LOG=info cargo run
+```
+Hint: dont forget to create kafka topics
 
+## Create Docker image
 ```
-docker-compose up -d
 docker build -t pushy-image .
-docker run pushy-image pushy --network="host"
+docker run pushy-image pushy
 ```
-Hint: dont forget to create to create db schema and kafka topics

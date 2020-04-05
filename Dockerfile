@@ -2,8 +2,6 @@ FROM rust:latest as cargo-build
 
 WORKDIR /usr/src/pushy
 
-RUN apt-get update && apt-get install -y postgresql-client
-
 COPY Cargo.toml Cargo.toml
 
 RUN mkdir src/
