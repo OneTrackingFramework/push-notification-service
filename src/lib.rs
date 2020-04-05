@@ -261,6 +261,7 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
 
     // Do db migrations
     embedded_migrations::run(&connection)?;
+    info!("Database migrations completed");
 
     let mut consumer = create_kafka_consumer(config.clone())?;
     let mut producer = create_kafka_producer(config.clone())?;
