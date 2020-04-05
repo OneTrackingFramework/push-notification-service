@@ -12,9 +12,14 @@ mod db;
 mod messaging;
 
 use std::env;
-use std::io::{self, Write};
-
 use std::error::Error;
+use std::io::{self, Write};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
+use std::time::Duration;
 
 use db::models::*;
 use diesel::pg::PgConnection;
@@ -24,7 +29,7 @@ use messaging::firebase::*;
 use futures::executor;
 
 use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
-use std::time::Duration;
+use kafka::producer::{Producer, Record, RequiredAcks};
 
 fn establish_connection() -> PgConnection {
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -35,19 +40,26 @@ fn establish_connection() -> PgConnection {
 }
 
 fn create_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
-        let mut cb = Consumer::from_hosts(config.brokers)
-            .with_group(config.group)
-            .with_fallback_offset(config.fallback_offset)
-            .with_fetch_max_wait_time(Duration::from_secs(config.fetch_max_wait_time))
-            .with_fetch_min_bytes(config.fetch_min_bytes)
-            .with_fetch_max_bytes_per_partition(config.fetch_max_bytes_per_partition)
-            .with_retry_max_bytes_limit(config.retry_max_bytes_limit)
-            .with_offset_storage(config.offset_storage)
-            .with_client_id("kafka-pushy-consumer".into());
-        for topic in config.topics {
-            cb = cb.with_topic(topic);
-        }
-        Ok(cb.create()?)
+    let mut cb = Consumer::from_hosts(config.brokers)
+        .with_group(config.group)
+        .with_fallback_offset(config.fallback_offset)
+        .with_fetch_max_wait_time(Duration::from_secs(config.fetch_max_wait_time))
+        .with_fetch_min_bytes(config.fetch_min_bytes)
+        .with_fetch_max_bytes_per_partition(config.fetch_max_bytes_per_partition)
+        .with_retry_max_bytes_limit(config.retry_max_bytes_limit)
+        .with_offset_storage(config.offset_storage)
+        .with_client_id("kafka-pushy-consumer".into());
+    for topic in config.topics {
+        cb = cb.with_topic(topic);
+    }
+    Ok(cb.create()?)
+}
+
+fn create_producer(config: Config) -> Result<Producer, Box<dyn Error>> {
+    Ok(Producer::from_hosts(config.brokers)
+        .with_ack_timeout(Duration::from_secs(config.ack_timeout))
+        .with_required_acks(RequiredAcks::One)
+        .create()?)
 }
 
 #[derive(Clone)]
@@ -63,6 +75,8 @@ pub struct Config {
     fetch_max_bytes_per_partition: i32,
     retry_max_bytes_limit: i32,
     no_commit: bool,
+    ack_timeout: u64,
+    shutdown_topic: String,
 }
 
 impl Config {
@@ -122,6 +136,12 @@ impl Config {
         if commit.eq_ignore_ascii_case("TRUE") {
             no_commit = true;
         }
+        let ack_timeout = u64::from_str_radix(
+            &env::var("KAFKA_ACK_TIMEOUT").expect("KAFKA_ACK_TIMEOUT must be set"),
+            10,
+        )
+        .unwrap();
+        let shutdown_topic = env::var("KAFKA_SHUTDOWN_TOPIC").expect("KAFKA_SHUTDOWN_TOPIC  must be set");
         Ok(Config {
             fcm_api_key,
             topics,
@@ -134,6 +154,8 @@ impl Config {
             fetch_max_bytes_per_partition,
             retry_max_bytes_limit,
             no_commit,
+            ack_timeout,
+            shutdown_topic,
         })
     }
 }
@@ -229,40 +251,68 @@ pub fn send_messages_to_user<'a>(
     }
 }
 
-pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
+pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
     let connection = establish_connection();
 
     let mut consumer = create_consumer(config.clone())?;
+    let mut producer = create_producer(config.clone())?;
+
+    let producer_config = config.clone();
 
     create_user_device_mapping(&connection, "Max Mustermann", "12345", DeviceTypeName::IOS);
     //send_messages_to_user(&connection, &config.fcm_api_key, "Max", "Hallo", "Welt");
     delete_user_device_mapping(&connection, "12345");
 
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    let mut buf = Vec::with_capacity(1024);
+    let kafka_thread = thread::spawn(move || {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        let mut buf = Vec::with_capacity(1024);
 
-    info!("Service started. Listening for events...");
-    let do_commit = !config.no_commit;
-    loop {
-        for ms in consumer.poll()?.iter() {
-            for m in ms.messages() {
-                // ~ clear the output buffer
-                unsafe { buf.set_len(0) };
-                // ~ format the message for output
-                let _ = write!(buf, "{}:{}@{}:\n", ms.topic(), ms.partition(), m.offset);
-                buf.extend_from_slice(m.value);
-                buf.push(b'\n');
-                // ~ write to output channel
-                stdout.write_all(&buf)?;
+        info!("Service started. Listening for events...");
+
+        let do_commit = !config.no_commit;
+        'kafka_msg_cycle: loop {
+            for ms in consumer
+                .poll()
+                .expect("Failed to poll from Kafka consumer")
+                .iter()
+            {
+                if ms.topic() == config.shutdown_topic {
+                    consumer
+                        .commit_consumed()
+                        .expect("Failed to commit consumed message");
+                    break 'kafka_msg_cycle;
+                }
+                for m in ms.messages() {
+                    // ~ clear the output buffer
+                    unsafe { buf.set_len(0) };
+                    // ~ format the message for output
+                    let _ = write!(buf, "{}:{}@{}:\n", ms.topic(), ms.partition(), m.offset);
+                    buf.extend_from_slice(m.value);
+                    buf.push(b'\n');
+                    // ~ write to output channel
+                    stdout
+                        .write_all(&buf)
+                        .expect("Failed to write buf to stdout");
+                }
+                let _ = consumer.consume_messageset(ms);
             }
-            let _ = consumer.consume_messageset(ms);
+            if do_commit {
+                consumer
+                    .commit_consumed()
+                    .expect("Failed to commit consumed message");
+            }
         }
-        if do_commit {
-            consumer.commit_consumed()?;
-        }
-    }
+    });
 
+    while !shutdown.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_secs(1));
+    }
     info!("Shutting down");
+
+    producer.send(&Record::from_value(&producer_config.shutdown_topic, "".as_bytes())).unwrap();
+   
+    kafka_thread.join().expect("Could not join Kafka thread");
+
     Ok(())
 }

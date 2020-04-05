@@ -5,9 +5,21 @@ use dotenv::dotenv;
 use std::env;
 use std::process;
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use pushy::*;
 
 fn main() {
+    let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let handler_shutdown = shutdown.clone();
+    ctrlc::set_handler(move || {
+        handler_shutdown.store(true, Ordering::Relaxed);
+    })
+    .expect("Error setting Ctrl-C handler");
+
     dotenv().ok();
     env_logger::init();
 
@@ -18,7 +30,7 @@ fn main() {
         process::exit(1);
     });
 
-    if let Err(e) = run(config) {
+    if let Err(e) = run(config, shutdown) {
         eprintln!("Application error: {}", e);
         process::exit(1);
     }
