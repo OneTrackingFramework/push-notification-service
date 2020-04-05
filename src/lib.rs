@@ -4,6 +4,8 @@ extern crate env_logger;
 
 #[macro_use]
 extern crate diesel;
+#[macro_use]
+extern crate diesel_migrations;
 extern crate dotenv;
 
 extern crate kafka;
@@ -30,6 +32,8 @@ use futures::executor;
 
 use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
 use kafka::producer::{Producer, Record, RequiredAcks};
+
+embed_migrations!("./migrations");
 
 fn establish_connection() -> PgConnection {
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -254,6 +258,9 @@ pub fn send_messages_to_user<'a>(
 
 pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
     let connection = establish_connection();
+
+    // Do db migrations
+    embedded_migrations::run(&connection)?;
 
     let mut consumer = create_kafka_consumer(config.clone())?;
     let mut producer = create_kafka_producer(config.clone())?;
