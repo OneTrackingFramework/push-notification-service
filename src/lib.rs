@@ -27,8 +27,7 @@ use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use messaging::fcm_helper::*;
 
-use futures::executor;
-use threadpool::ThreadPool;
+use futures::executor::ThreadPool;
 
 use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
 
@@ -259,7 +258,7 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
 
     info!("Service started. Listening for events...");
 
-    let pool = ThreadPool::new(config.threadpool_workers);
+    let pool = ThreadPool::new().unwrap();
 
     while !shutdown.load(Ordering::Relaxed) {
         for ms in consumer
@@ -269,10 +268,10 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
         {
             for m in ms.messages() {
                 let connection = connection.clone();
-                pool.execute(move || {
+                pool.spawn_ok(async move {
                     create_user_device_mapping(connection.clone(), "Max Mustermann", "12345", DeviceTypeName::IOS);
                     //send_messages_to_user(connection, &config.fcm_api_key, "Max", "Hallo", "Welt");
-                    delete_user_device_mapping(connection, "12345");
+                    delete_user_device_mapping(connection, "12345").await;
 
                     /*
                     // ~ clear the output buffer
@@ -296,7 +295,6 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                 .expect("Failed to commit consumed message");
         }
     }
-    pool.join();
     info!("Shutting down");
     Ok(())
 }
