@@ -10,7 +10,7 @@ This microservice is implemented for the One Tracking Framework, which was origi
 
 ## Test with Docker environment
 ```
-docker-compose up -d # setup environment
+docker-compose up -d  # setup environment
 RUST_LOG=info cargo run
 ```
 Hint: dont forget to create kafka topics
