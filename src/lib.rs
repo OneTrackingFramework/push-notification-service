@@ -268,11 +268,18 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
         {
             for m in ms.messages() {
                 let connection = connection.clone();
+                let topic = ms.topic().to_owned();
                 pool.spawn_ok(async move {
                     create_user_device_mapping(connection.clone(), "Max Mustermann", "12345", DeviceTypeName::IOS);
                     //send_messages_to_user(connection, &config.fcm_api_key, "Max", "Hallo", "Welt");
                     delete_user_device_mapping(connection, "12345").await;
 
+                    match &topic[..] {
+                        "push-notification" => info!("Push"),
+                        "create-user-device-mapping" => info!("Create"),
+                        "delete-user-device-mapping" => info!("Delete"),
+                        unknown => warn!("Cannot handle unknown topic: {}", unknown),
+                    };
                     /*
                     // ~ clear the output buffer
                     unsafe { buf.set_len(0) };
