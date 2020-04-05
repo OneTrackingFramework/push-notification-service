@@ -12,6 +12,7 @@ extern crate kafka;
 
 mod db;
 mod messaging;
+mod service;
 
 use std::env;
 use std::error::Error;
@@ -26,7 +27,7 @@ use std::time::Duration;
 use db::models::*;
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
-use messaging::firebase::*;
+use messaging::fcm_helper::*;
 
 use futures::executor;
 
