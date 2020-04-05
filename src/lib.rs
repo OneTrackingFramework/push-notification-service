@@ -31,6 +31,8 @@ use futures::executor::ThreadPool;
 
 use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
 
+use service::jwt_helper::JWTHelper;
+
 embed_migrations!("./migrations");
 
 fn establish_connection() -> PgConnection {
@@ -71,6 +73,7 @@ pub struct Config {
     fetch_max_bytes_per_partition: i32,
     retry_max_bytes_limit: i32,
     no_commit: bool,
+    jwt_secret: String,
 }
 
 impl Config {
@@ -135,6 +138,7 @@ impl Config {
         if commit.eq_ignore_ascii_case("TRUE") {
             no_commit = true;
         }
+        let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
         Ok(Config {
             fcm_api_key,
             threadpool_workers,
@@ -148,6 +152,7 @@ impl Config {
             fetch_max_bytes_per_partition,
             retry_max_bytes_limit,
             no_commit,
+            jwt_secret,
         })
     }
 }
@@ -252,13 +257,10 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
 
     let mut consumer = create_kafka_consumer(config.clone()).unwrap();
 
-    // let stdout = io::stdout();
-    // let mut stdout = stdout.lock();
-    // let mut buf = Vec::with_capacity(1024);
-
     info!("Service started. Listening for events...");
 
     let pool = ThreadPool::new().unwrap();
+    let consumer_config = Arc::new(config.clone());
 
     while !shutdown.load(Ordering::Relaxed) {
         for ms in consumer
@@ -269,29 +271,28 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
             for m in ms.messages() {
                 let connection = connection.clone();
                 let topic = ms.topic().to_owned();
+                let message = String::from_utf8(m.value.to_owned());
+                let config = consumer_config.clone();
                 pool.spawn_ok(async move {
-                    create_user_device_mapping(connection.clone(), "Max Mustermann", "12345", DeviceTypeName::IOS);
-                    //send_messages_to_user(connection, &config.fcm_api_key, "Max", "Hallo", "Welt");
+                    //create_user_device_mapping(connection.clone(), "Max Mustermann", "12345", DeviceTypeName::IOS).await;
+                    //send_messages_to_user(connection.clone(), &config.fcm_api_key, "Max", "Hallo", "Welt").await;
                     delete_user_device_mapping(connection, "12345").await;
 
-                    match &topic[..] {
-                        "push-notification" => info!("Push"),
-                        "create-user-device-mapping" => info!("Create"),
-                        "delete-user-device-mapping" => info!("Delete"),
-                        unknown => warn!("Cannot handle unknown topic: {}", unknown),
-                    };
-                    /*
-                    // ~ clear the output buffer
-                    unsafe { buf.set_len(0) };
-                    // ~ format the message for output
-                    let _ = write!(buf, "{}:{}@{}:\n", ms.topic(), ms.partition(), m.offset);
-                    buf.extend_from_slice(m.value);
-                    buf.push(b'\n');
-                    // ~ write to output channel
-                    stdout
-                        .write_all(&buf)
-                        .expect("Failed to write buf to stdout");
-                    */
+                    if let Ok(message) = message {
+                        let jwt_helper = JWTHelper::new(&config.jwt_secret);
+                        if jwt_helper.validate(&message) {
+                            match &topic[..] {
+                                "push-notification" => info!("Push"),
+                                "create-user-device-mapping" => info!("Create"),
+                                "delete-user-device-mapping" => info!("Delete"),
+                                unknown => warn!("Cannot handle unknown topic: {}", unknown),
+                            };
+                        } else {
+                            warn!("Invalid jwt");
+                        }
+                    } else {
+                        warn!("Could not decode message");
+                    }
                 });
             }
             let _ = consumer.consume_messageset(ms);

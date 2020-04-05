@@ -17,7 +17,7 @@ impl JWTHelper {
         }
     }
     pub fn decode(&self, token: &str) {
-        let token_message = decode::<Claims>(
+        let _token_message = decode::<Claims>(
             token,
             &DecodingKey::from_secret(self.secret.as_ref()),
             &Validation::new(Algorithm::HS256),
@@ -25,5 +25,10 @@ impl JWTHelper {
     }
     pub fn encode(&self) -> String {
         "".to_owned()
+    }
+    pub fn validate(&self, token: &str) -> bool{
+        self.decode(token);
+        self.encode();
+        true
     }
 }
