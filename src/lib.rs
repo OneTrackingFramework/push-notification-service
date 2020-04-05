@@ -19,9 +19,8 @@ use std::error::Error;
 use std::io::{self, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc
 };
-use std::thread;
 use std::time::Duration;
 
 use db::models::*;
@@ -30,9 +29,9 @@ use diesel::prelude::*;
 use messaging::fcm_helper::*;
 
 use futures::executor;
+use threadpool::ThreadPool;
 
 use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
-use kafka::producer::{Producer, Record, RequiredAcks};
 
 embed_migrations!("./migrations");
 
@@ -44,9 +43,9 @@ fn establish_connection() -> PgConnection {
     connection
 }
 
-fn create_kafka_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
-    let mut cb = Consumer::from_hosts(config.brokers)
-        .with_group(config.group)
+fn create_kafka_consumer(config: Arc<Config>) -> Result<Consumer, Box<dyn Error>> {
+    let mut cb = Consumer::from_hosts(config.brokers.clone())
+        .with_group(config.group.clone())
         .with_fallback_offset(config.fallback_offset)
         .with_fetch_max_wait_time(Duration::from_secs(config.fetch_max_wait_time))
         .with_fetch_min_bytes(config.fetch_min_bytes)
@@ -54,22 +53,16 @@ fn create_kafka_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
         .with_retry_max_bytes_limit(config.retry_max_bytes_limit)
         .with_offset_storage(config.offset_storage)
         .with_client_id("kafka-pushy-consumer".into());
-    for topic in config.topics {
+    for topic in config.topics.clone() {
         cb = cb.with_topic(topic);
     }
     Ok(cb.create()?)
 }
 
-fn create_kafka_producer(config: Config) -> Result<Producer, Box<dyn Error>> {
-    Ok(Producer::from_hosts(config.brokers)
-        .with_ack_timeout(Duration::from_secs(config.ack_timeout))
-        .with_required_acks(RequiredAcks::One)
-        .create()?)
-}
-
 #[derive(Clone)]
 pub struct Config {
     fcm_api_key: String,
+    threadpool_workers: usize,
     topics: Vec<String>,
     brokers: Vec<String>,
     group: String,
@@ -80,8 +73,6 @@ pub struct Config {
     fetch_max_bytes_per_partition: i32,
     retry_max_bytes_limit: i32,
     no_commit: bool,
-    ack_timeout: u64,
-    shutdown_topic: String,
 }
 
 impl Config {
@@ -90,6 +81,7 @@ impl Config {
             return Err("not enough arguments");
         }
         let fcm_api_key = env::var("FCM_API_KEY").expect("FCM_API_KEY must be set");
+        let threadpool_workers = usize::from_str_radix(&env::var("THREADPOOL_WORKERS").expect("THREADPOOL_WORKERS must be set"), 10).unwrap();
         let topics: Vec<String> = env::var("KAFKA_TOPICS")
             .expect("KAFKA_TOPICS must be set")
             .split(',')
@@ -141,15 +133,9 @@ impl Config {
         if commit.eq_ignore_ascii_case("TRUE") {
             no_commit = true;
         }
-        let ack_timeout = u64::from_str_radix(
-            &env::var("KAFKA_ACK_TIMEOUT").expect("KAFKA_ACK_TIMEOUT must be set"),
-            10,
-        )
-        .unwrap();
-        let shutdown_topic =
-            env::var("KAFKA_SHUTDOWN_TOPIC").expect("KAFKA_SHUTDOWN_TOPIC  must be set");
         Ok(Config {
             fcm_api_key,
+            threadpool_workers,
             topics,
             brokers,
             group,
@@ -160,8 +146,6 @@ impl Config {
             fetch_max_bytes_per_partition,
             retry_max_bytes_limit,
             no_commit,
-            ack_timeout,
-            shutdown_topic,
         })
     }
 }
@@ -264,37 +248,35 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
     embedded_migrations::run(&connection)?;
     info!("Database migrations completed");
 
-    let mut consumer = create_kafka_consumer(config.clone())?;
-    let mut producer = create_kafka_producer(config.clone())?;
-
-    let producer_config = config.clone();
 
     create_user_device_mapping(&connection, "Max Mustermann", "12345", DeviceTypeName::IOS);
     //send_messages_to_user(&connection, &config.fcm_api_key, "Max", "Hallo", "Welt");
     delete_user_device_mapping(&connection, "12345");
 
-    let kafka_thread = thread::spawn(move || {
-        let stdout = io::stdout();
-        let mut stdout = stdout.lock();
-        let mut buf = Vec::with_capacity(1024);
+    
+        // let stdout = io::stdout();
+        // let mut stdout = stdout.lock();
+        // let mut buf = Vec::with_capacity(1024);
 
-        info!("Service started. Listening for events...");
+    info!("Service started. Listening for events...");
 
-        'kafka_msg_cycle: loop {
+    let pool = ThreadPool::new(config.threadpool_workers);
+    let consumer_config = Arc::new(config);
+
+    for _ in 0..pool.max_count() {
+        let consumer_config = consumer_config.clone();
+        let shutdown = shutdown.clone();
+        pool.execute(move || {
+        let mut consumer = create_kafka_consumer(consumer_config.clone()).unwrap();
+
+        while !shutdown.load(Ordering::Relaxed) {
             for ms in consumer
                 .poll()
                 .expect("Failed to poll from Kafka consumer")
                 .iter()
             {
-                if ms.topic() == config.shutdown_topic {
-                    if !config.no_commit {
-                        consumer
-                            .commit_consumed()
-                            .expect("Failed to commit consumed message");
-                    }
-                    break 'kafka_msg_cycle;
-                }
                 for m in ms.messages() {
+                    /*
                     // ~ clear the output buffer
                     unsafe { buf.set_len(0) };
                     // ~ format the message for output
@@ -305,30 +287,18 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                     stdout
                         .write_all(&buf)
                         .expect("Failed to write buf to stdout");
+                    */
                 }
                 let _ = consumer.consume_messageset(ms);
             }
-            if !config.no_commit {
+            if !consumer_config.no_commit {
                 consumer
                     .commit_consumed()
                     .expect("Failed to commit consumed message");
             }
-        }
-    });
-
-    while !shutdown.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_secs(1));
+        }});
     }
+    pool.join();
     info!("Shutting down");
-
-    producer
-        .send(&Record::from_value(
-            &producer_config.shutdown_topic,
-            "".as_bytes(),
-        ))
-        .unwrap();
-
-    kafka_thread.join().expect("Could not join Kafka thread");
-
     Ok(())
 }
