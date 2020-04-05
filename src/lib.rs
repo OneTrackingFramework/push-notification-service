@@ -16,10 +16,9 @@ mod service;
 
 use std::env;
 use std::error::Error;
-use std::io::{self, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc
+    Arc,
 };
 use std::time::Duration;
 
@@ -43,9 +42,9 @@ fn establish_connection() -> PgConnection {
     connection
 }
 
-fn create_kafka_consumer(config: Arc<Config>) -> Result<Consumer, Box<dyn Error>> {
-    let mut cb = Consumer::from_hosts(config.brokers.clone())
-        .with_group(config.group.clone())
+fn create_kafka_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
+    let mut cb = Consumer::from_hosts(config.brokers)
+        .with_group(config.group)
         .with_fallback_offset(config.fallback_offset)
         .with_fetch_max_wait_time(Duration::from_secs(config.fetch_max_wait_time))
         .with_fetch_min_bytes(config.fetch_min_bytes)
@@ -53,7 +52,7 @@ fn create_kafka_consumer(config: Arc<Config>) -> Result<Consumer, Box<dyn Error>
         .with_retry_max_bytes_limit(config.retry_max_bytes_limit)
         .with_offset_storage(config.offset_storage)
         .with_client_id("kafka-pushy-consumer".into());
-    for topic in config.topics.clone() {
+    for topic in config.topics {
         cb = cb.with_topic(topic);
     }
     Ok(cb.create()?)
@@ -81,7 +80,11 @@ impl Config {
             return Err("not enough arguments");
         }
         let fcm_api_key = env::var("FCM_API_KEY").expect("FCM_API_KEY must be set");
-        let threadpool_workers = usize::from_str_radix(&env::var("THREADPOOL_WORKERS").expect("THREADPOOL_WORKERS must be set"), 10).unwrap();
+        let threadpool_workers = usize::from_str_radix(
+            &env::var("THREADPOOL_WORKERS").expect("THREADPOOL_WORKERS must be set"),
+            10,
+        )
+        .unwrap();
         let topics: Vec<String> = env::var("KAFKA_TOPICS")
             .expect("KAFKA_TOPICS must be set")
             .split(',')
@@ -248,34 +251,29 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
     embedded_migrations::run(&connection)?;
     info!("Database migrations completed");
 
+    let mut consumer = create_kafka_consumer(config.clone()).unwrap();
 
     create_user_device_mapping(&connection, "Max Mustermann", "12345", DeviceTypeName::IOS);
     //send_messages_to_user(&connection, &config.fcm_api_key, "Max", "Hallo", "Welt");
     delete_user_device_mapping(&connection, "12345");
 
-    
-        // let stdout = io::stdout();
-        // let mut stdout = stdout.lock();
-        // let mut buf = Vec::with_capacity(1024);
+    // let stdout = io::stdout();
+    // let mut stdout = stdout.lock();
+    // let mut buf = Vec::with_capacity(1024);
 
     info!("Service started. Listening for events...");
 
     let pool = ThreadPool::new(config.threadpool_workers);
-    let consumer_config = Arc::new(config);
 
-    for _ in 0..pool.max_count() {
-        let consumer_config = consumer_config.clone();
-        let shutdown = shutdown.clone();
-        pool.execute(move || {
-        let mut consumer = create_kafka_consumer(consumer_config.clone()).unwrap();
+    while !shutdown.load(Ordering::Relaxed) {
+        for ms in consumer
+            .poll()
+            .expect("Failed to poll from Kafka consumer")
+            .iter()
+        {
+            for m in ms.messages() {
+                pool.execute(move || {
 
-        while !shutdown.load(Ordering::Relaxed) {
-            for ms in consumer
-                .poll()
-                .expect("Failed to poll from Kafka consumer")
-                .iter()
-            {
-                for m in ms.messages() {
                     /*
                     // ~ clear the output buffer
                     unsafe { buf.set_len(0) };
@@ -288,15 +286,15 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                         .write_all(&buf)
                         .expect("Failed to write buf to stdout");
                     */
-                }
-                let _ = consumer.consume_messageset(ms);
+                });
             }
-            if !consumer_config.no_commit {
-                consumer
-                    .commit_consumed()
-                    .expect("Failed to commit consumed message");
-            }
-        }});
+            let _ = consumer.consume_messageset(ms);
+        }
+        if !config.no_commit {
+            consumer
+                .commit_consumed()
+                .expect("Failed to commit consumed message");
+        }
     }
     pool.join();
     info!("Shutting down");
