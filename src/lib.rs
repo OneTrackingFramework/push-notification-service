@@ -37,8 +37,7 @@ embed_migrations!("./migrations");
 
 fn establish_connection() -> PgConnection {
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let connection = PgConnection::establish(&database_url)
-        .expect(&format!("Error connecting to {}", database_url));
+    let connection = PgConnection::establish(&database_url).unwrap_or_else(|_| panic!("Error connecting to {}", database_url));
     info!("Established database connection");
     connection
 }
@@ -78,7 +77,7 @@ pub struct Config {
 
 impl Config {
     pub fn new(args: &[String]) -> Result<Config, &'static str> {
-        if args.len() < 1 {
+        if args.is_empty() {
             return Err("not enough arguments");
         }
         let fcm_api_key = env::var("FCM_API_KEY").expect("FCM_API_KEY must be set");
@@ -101,7 +100,7 @@ impl Config {
             .collect();
         let group = env::var("KAFKA_GROUP").expect("KAFKA_GROUP must be set");
         let mut fallback_offset = FetchOffset::Latest;
-        if let Ok(_) = env::var("KAFKA_FALLBACK_OFFSET") {
+        if env::var("KAFKA_FALLBACK_OFFSET").is_ok() {
             fallback_offset = FetchOffset::Earliest;
         };
         let storage = env::var("KAFKA_OFFSET_STORAGE").expect("KAFKA_OFFSET_STORAGE must be set");
@@ -134,10 +133,7 @@ impl Config {
         )
         .unwrap();
         let commit = env::var("KAFKA_NO_COMMIT").expect("KAFKA_NO_COMMIT must be set");
-        let mut no_commit = false;
-        if commit.eq_ignore_ascii_case("TRUE") {
-            no_commit = true;
-        }
+        let no_commit = commit.eq_ignore_ascii_case("TRUE");
         let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
         Ok(Config {
             fcm_api_key,
@@ -205,7 +201,7 @@ pub async fn create_user_device_mapping<'a>(
 pub async fn delete_user_device_mapping<'a>(connection: Arc<Mutex<PgConnection>>, delete_token: &'a str) {
     use db::schema::puser::dsl::*;
 
-    if let Ok(_) = diesel::delete(puser.filter(token.eq(delete_token))).execute(&*connection.lock().unwrap()) {
+    if diesel::delete(puser.filter(token.eq(delete_token))).execute(&*connection.lock().unwrap()).is_ok() {
         debug!("Deleted user / device mapping for token: {}", delete_token);
     } else {
         warn! {"Could not delete user / device mapping for token: {}", delete_token};
