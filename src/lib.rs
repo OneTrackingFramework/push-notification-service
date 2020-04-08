@@ -18,7 +18,7 @@ use std::env;
 use std::error::Error;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -31,13 +31,15 @@ use futures::executor::ThreadPool;
 
 use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
 
+use service::models::{CreateMapping, DeleteMapping, SendMessage};
 use service::jwt_helper::JWTHelper;
 
 embed_migrations!("./migrations");
 
 fn establish_connection() -> PgConnection {
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let connection = PgConnection::establish(&database_url).unwrap_or_else(|_| panic!("Error connecting to {}", database_url));
+    let connection = PgConnection::establish(&database_url)
+        .unwrap_or_else(|_| panic!("Error connecting to {}", database_url));
     info!("Established database connection");
     connection
 }
@@ -153,25 +155,19 @@ impl Config {
     }
 }
 
-#[derive(Debug)]
-pub enum DeviceTypeName {
-    IOS,
-    FIREBASE, // Can be Android and iOS
-}
-
 pub async fn create_user_device_mapping<'a>(
     connection: Arc<Mutex<PgConnection>>,
     new_user_id: &'a str,
     new_token: &'a str,
-    dtype_name: DeviceTypeName,
+    dtype_name: service::models::DeviceType,
 ) {
     use db::schema::pdevicetype::dsl::*;
     use db::schema::puser::dsl::*;
 
     if let Ok(new_devicetype) = pdevicetype
         .filter(name.eq(match dtype_name {
-            DeviceTypeName::FIREBASE => "FIREBASE",
-            DeviceTypeName::IOS => "IOS",
+            service::models::DeviceType::FIREBASE => "FIREBASE",
+            service::models::DeviceType::IOS => "IOS",
         }))
         .limit(1)
         .load::<DeviceType>(&*connection.lock().unwrap())
@@ -198,10 +194,16 @@ pub async fn create_user_device_mapping<'a>(
     }
 }
 
-pub async fn delete_user_device_mapping<'a>(connection: Arc<Mutex<PgConnection>>, delete_token: &'a str) {
+pub async fn delete_user_device_mapping<'a>(
+    connection: Arc<Mutex<PgConnection>>,
+    delete_token: &'a str,
+) {
     use db::schema::puser::dsl::*;
 
-    if diesel::delete(puser.filter(token.eq(delete_token))).execute(&*connection.lock().unwrap()).is_ok() {
+    if diesel::delete(puser.filter(token.eq(delete_token)))
+        .execute(&*connection.lock().unwrap())
+        .is_ok()
+    {
         debug!("Deleted user / device mapping for token: {}", delete_token);
     } else {
         warn! {"Could not delete user / device mapping for token: {}", delete_token};
@@ -224,9 +226,7 @@ pub async fn send_messages_to_user<'a>(
         for user in users {
             match &user.1.name[..] {
                 "FIREBASE" => {
-                    if let Err(e) =
-                        send_message(fcm_api_key, &user.0.token, title, body).await
-                    {
+                    if let Err(e) = send_message(fcm_api_key, &user.0.token, title, body).await {
                         warn!("Could not execute send message future: {}", e);
                     }
                 }
@@ -270,17 +270,28 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                 let message = String::from_utf8(m.value.to_owned());
                 let config = consumer_config.clone();
                 pool.spawn_ok(async move {
-                    //create_user_device_mapping(connection.clone(), "Max Mustermann", "12345", DeviceTypeName::IOS).await;
-                    //send_messages_to_user(connection.clone(), &config.fcm_api_key, "Max", "Hallo", "Welt").await;
-                    delete_user_device_mapping(connection, "12345").await;
-
                     if let Ok(message) = message {
                         let jwt_helper = JWTHelper::new(&config.jwt_secret);
                         if jwt_helper.validate(&message) {
                             match &topic[..] {
-                                "push-notification" => info!("Push"),
-                                "create-user-device-mapping" => info!("Create"),
-                                "delete-user-device-mapping" => info!("Delete"),
+                                "push-notification" => {
+                                    let deser_send_message: SendMessage =
+                                        serde_json::from_str(&message).unwrap();
+                                    send_messages_to_user(connection.clone(), &config.fcm_api_key, "Max", "Hallo", "Welt").await;
+
+                                }
+                                "create-user-device-mapping" => {
+                                    let deser_create_mapping: CreateMapping =
+                                        serde_json::from_str(&message).unwrap();
+                                    create_user_device_mapping(connection.clone(), "Max Mustermann", "12345", service::models::DeviceType::IOS).await;
+
+                                }
+                                "delete-user-device-mapping" => {
+                                    let deser_delete_mapping: DeleteMapping =
+                                        serde_json::from_str(&message).unwrap();
+                                    delete_user_device_mapping(connection, "12345").await;
+
+                                }
                                 unknown => warn!("Cannot handle unknown topic: {}", unknown),
                             };
                         } else {

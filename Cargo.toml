@@ -19,3 +19,4 @@ futures = { version = "0.3.4", features = ["thread-pool"] }
 ctrlc = "3.1.4"
 jsonwebtoken = "7.1.0"
 serde = "1.0.106"
+serde_json = "1.0.51"

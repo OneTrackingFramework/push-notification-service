@@ -26,7 +26,7 @@ impl JWTHelper {
     pub fn encode(&self) -> String {
         "".to_owned()
     }
-    pub fn validate(&self, token: &str) -> bool{
+    pub fn validate(&self, token: &str) -> bool {
         self.decode(token);
         self.encode();
         true
