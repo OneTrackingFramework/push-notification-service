@@ -284,28 +284,41 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                         if jwt_helper.validate(&message) {
                             match &topic[..] {
                                 "push-notification" => {
-                                    let send_message_data: SendMessageData =
-                                        serde_json::from_str(&message).unwrap();
-                                    send_messages_to_user(
-                                        connection.clone(),
-                                        fcm_client,
-                                        send_message_data,
-                                    )
-                                    .await;
+                                    if let Ok(send_message_data) =
+                                        serde_json::from_str::<SendMessageData>(&message)
+                                    {
+                                        send_messages_to_user(
+                                            connection.clone(),
+                                            fcm_client,
+                                            send_message_data,
+                                        )
+                                        .await;
+                                    } else {
+                                        warn!("Could deserialize data for sending")
+                                    }
                                 }
                                 "create-user-device-mapping" => {
-                                    let create_user_data: CreateUserData =
-                                        serde_json::from_str(&message).unwrap();
-                                    create_user_device_mapping(
-                                        connection.clone(),
-                                        create_user_data,
-                                    )
-                                    .await;
+                                    if let Ok(create_user_data) =
+                                        serde_json::from_str::<CreateUserData>(&message)
+                                    {
+                                        create_user_device_mapping(
+                                            connection.clone(),
+                                            create_user_data,
+                                        )
+                                        .await;
+                                    } else {
+                                        warn!("Could deserialize data to create user mapping")
+                                    }
                                 }
                                 "delete-user-device-mapping" => {
-                                    let delete_user_data: DeleteUserData =
-                                        serde_json::from_str(&message).unwrap();
-                                    delete_user_device_mapping(connection, delete_user_data).await;
+                                    if let Ok(delete_user_data) =
+                                        serde_json::from_str::<DeleteUserData>(&message)
+                                    {
+                                        delete_user_device_mapping(connection, delete_user_data)
+                                            .await;
+                                    } else {
+                                        warn!("Could deserialize data to delete user mapping")
+                                    }
                                 }
                                 unknown => warn!("Cannot handle unknown topic: {}", unknown),
                             };
