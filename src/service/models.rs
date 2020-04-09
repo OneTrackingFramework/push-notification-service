@@ -6,22 +6,22 @@ pub enum DeviceType {
     FIREBASE, // Can be Android and iOS
 }
 
-#[derive(Deserialize)]
-pub struct CreateMapping {
-    pub userId: String,
-    pub deviceToken: String,
-    pub deviceType: DeviceType,
+#[derive(Debug, Deserialize)]
+pub struct CreateUserData {
+    pub user_id: String,
+    pub device_token: String,
+    pub device_type: DeviceType,
 }
 
-#[derive(Deserialize)]
-pub struct DeleteMapping {
-    pub userId: String,
-    pub devieToken: String,
+#[derive(Debug, Deserialize)]
+pub struct DeleteUserData {
+    pub user_id: String,
+    pub devie_token: String,
 }
 
-#[derive(Deserialize)]
-pub struct SendMessage {
-    pub userId: String,
+#[derive(Debug, Deserialize)]
+pub struct SendMessageData {
+    pub user_id: String,
     pub title: String,
     pub body: String,
 }

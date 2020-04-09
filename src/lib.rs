@@ -7,8 +7,12 @@ extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
 extern crate dotenv;
+use db::models::*;
+use diesel::pg::PgConnection;
+use diesel::prelude::*;
 
 extern crate kafka;
+use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
 
 mod db;
 mod messaging;
@@ -22,17 +26,13 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use db::models::*;
-use diesel::pg::PgConnection;
-use diesel::prelude::*;
-use messaging::fcm_helper::*;
-
 use futures::executor::ThreadPool;
 
-use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
-
-use service::models::{CreateMapping, DeleteMapping, SendMessage};
 use service::jwt_helper::JWTHelper;
+use service::models::{CreateUserData, DeleteUserData, SendMessageData};
+
+use crate::messaging::client::MessagingClient;
+use messaging::fcm_helper::FirebaseCloudMessaging;
 
 embed_migrations!("./migrations");
 
@@ -157,15 +157,13 @@ impl Config {
 
 pub async fn create_user_device_mapping<'a>(
     connection: Arc<Mutex<PgConnection>>,
-    new_user_id: &'a str,
-    new_token: &'a str,
-    dtype_name: service::models::DeviceType,
+    create_user_data: CreateUserData,
 ) {
     use db::schema::pdevicetype::dsl::*;
     use db::schema::puser::dsl::*;
 
     if let Ok(new_devicetype) = pdevicetype
-        .filter(name.eq(match dtype_name {
+        .filter(name.eq(match create_user_data.device_type {
             service::models::DeviceType::FIREBASE => "FIREBASE",
             service::models::DeviceType::IOS => "IOS",
         }))
@@ -175,71 +173,79 @@ pub async fn create_user_device_mapping<'a>(
         let new_devicetype = &new_devicetype[0]; // B/c limit(1)
 
         let new_user = NewUser {
-            user_id: new_user_id,
+            user_id: &create_user_data.user_id,
             device_type_id: &new_devicetype.id,
-            token: new_token,
+            token: &create_user_data.device_token,
         };
         match diesel::insert_into(puser)
             .values(&new_user)
             .get_result::<User>(&*connection.lock().unwrap())
         {
             Err(e) => warn!(
-                "Could not create user / device mapping: {:?}, message: {}",
-                new_user, e
+                "Could not create mapping {:?}, b/c: {}",
+                create_user_data, e
             ),
-            Ok(created_user) => debug!("Created user / device mapping: {:?}", created_user),
+            Ok(_) => debug!("Created mapping: {:?}", create_user_data),
         }
     } else {
-        warn!("Could not create mapping for user: {}, b/c could not retrieve id for device type: {:?}", new_user_id, dtype_name);
+        warn!(
+            "Could not create mapping, b/c could not retrieve id for device type: {:?}",
+            create_user_data
+        );
     }
 }
 
 pub async fn delete_user_device_mapping<'a>(
     connection: Arc<Mutex<PgConnection>>,
-    delete_token: &'a str,
+    delete_user_data: DeleteUserData,
 ) {
     use db::schema::puser::dsl::*;
 
-    if diesel::delete(puser.filter(token.eq(delete_token)))
+    if diesel::delete(puser.filter(token.eq(&delete_user_data.devie_token)))
         .execute(&*connection.lock().unwrap())
         .is_ok()
     {
-        debug!("Deleted user / device mapping for token: {}", delete_token);
+        debug!("Deleted mapping: {:?}", delete_user_data);
     } else {
-        warn! {"Could not delete user / device mapping for token: {}", delete_token};
+        warn! {"Could not delete mapping: {:?}", delete_user_data};
     }
 }
 
 pub async fn send_messages_to_user<'a>(
     connection: Arc<Mutex<PgConnection>>,
-    fcm_api_key: &'a str,
-    send_user_id: &'a str,
-    title: &'a str,
-    body: &'a str,
+    fcm_client: Arc<FirebaseCloudMessaging>,
+    send_message_data: SendMessageData,
 ) {
     use db::schema::puser::dsl::*;
     let users: Result<Vec<(User, DeviceType)>, diesel::result::Error> = db::schema::puser::table
         .inner_join(db::schema::pdevicetype::table)
-        .filter(user_id.eq(send_user_id))
+        .filter(user_id.eq(&send_message_data.user_id))
         .load(&*connection.lock().unwrap());
     if let Ok(users) = users {
         for user in users {
             match &user.1.name[..] {
                 "FIREBASE" => {
-                    if let Err(e) = send_message(fcm_api_key, &user.0.token, title, body).await {
-                        warn!("Could not execute send message future: {}", e);
+                    if let Err(e) = fcm_client
+                        .send(
+                            &user.0.token,
+                            &send_message_data.title,
+                            &send_message_data.body,
+                        )
+                        .await
+                    {
+                        warn!("Could not send message {:?}, b/c: {}", send_message_data, e);
                     }
                 }
                 "IOS" => unimplemented!(),
                 unknown => {
-                    warn!("No action to send message for device type: {}", unknown);
+                    warn!("Could not send message {:?}, b/c no action to send message for device type: {}", send_message_data, unknown);
                 }
             }
         }
     } else {
         warn!(
-            "Could not send message, b/c could not retrieve user with id: {}",
-            send_user_id
+            "Could not send message {:?}, b/c could not retrieve user from database",
+            send_message_data
         );
     }
 }
@@ -252,6 +258,8 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
     info!("Database migrations completed");
 
     let mut consumer = create_kafka_consumer(config.clone()).unwrap();
+
+    let fcm_client = Arc::new(FirebaseCloudMessaging::new(&config.fcm_api_key));
 
     info!("Service started. Listening for events...");
 
@@ -269,28 +277,35 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                 let topic = ms.topic().to_owned();
                 let message = String::from_utf8(m.value.to_owned());
                 let config = consumer_config.clone();
+                let fcm_client = fcm_client.clone();
                 pool.spawn_ok(async move {
                     if let Ok(message) = message {
                         let jwt_helper = JWTHelper::new(&config.jwt_secret);
                         if jwt_helper.validate(&message) {
                             match &topic[..] {
                                 "push-notification" => {
-                                    let deser_send_message: SendMessage =
+                                    let send_message_data: SendMessageData =
                                         serde_json::from_str(&message).unwrap();
-                                    send_messages_to_user(connection.clone(), &config.fcm_api_key, "Max", "Hallo", "Welt").await;
-
+                                    send_messages_to_user(
+                                        connection.clone(),
+                                        fcm_client,
+                                        send_message_data,
+                                    )
+                                    .await;
                                 }
                                 "create-user-device-mapping" => {
-                                    let deser_create_mapping: CreateMapping =
+                                    let create_user_data: CreateUserData =
                                         serde_json::from_str(&message).unwrap();
-                                    create_user_device_mapping(connection.clone(), "Max Mustermann", "12345", service::models::DeviceType::IOS).await;
-
+                                    create_user_device_mapping(
+                                        connection.clone(),
+                                        create_user_data,
+                                    )
+                                    .await;
                                 }
                                 "delete-user-device-mapping" => {
-                                    let deser_delete_mapping: DeleteMapping =
+                                    let delete_user_data: DeleteUserData =
                                         serde_json::from_str(&message).unwrap();
-                                    delete_user_device_mapping(connection, "12345").await;
-
+                                    delete_user_device_mapping(connection, delete_user_data).await;
                                 }
                                 unknown => warn!("Cannot handle unknown topic: {}", unknown),
                             };
