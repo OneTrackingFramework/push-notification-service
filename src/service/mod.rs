@@ -1,2 +1,2 @@
-pub mod jwt_helper;
+pub mod jwe_helper;
 pub mod models;

@@ -28,10 +28,10 @@ use std::time::Duration;
 
 use futures::executor::ThreadPool;
 
-use service::jwt_helper::JWTHelper;
+use service::jwe_helper::JWEHelper;
 use service::models::{CreateUserData, DeleteUserData, SendMessageData};
 
-use crate::messaging::client::MessagingClient;
+use messaging::client::MessagingClient;
 use messaging::fcm_helper::FirebaseCloudMessaging;
 
 embed_migrations!("./migrations");
@@ -63,7 +63,6 @@ fn create_kafka_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
 #[derive(Clone)]
 pub struct Config {
     fcm_api_key: String,
-    threadpool_workers: usize,
     topics: Vec<String>,
     brokers: Vec<String>,
     group: String,
@@ -74,7 +73,7 @@ pub struct Config {
     fetch_max_bytes_per_partition: i32,
     retry_max_bytes_limit: i32,
     no_commit: bool,
-    jwt_secret: String,
+    jwe_secret: String,
 }
 
 impl Config {
@@ -83,11 +82,6 @@ impl Config {
             return Err("not enough arguments");
         }
         let fcm_api_key = env::var("FCM_API_KEY").expect("FCM_API_KEY must be set");
-        let threadpool_workers = usize::from_str_radix(
-            &env::var("THREADPOOL_WORKERS").expect("THREADPOOL_WORKERS must be set"),
-            10,
-        )
-        .unwrap();
         let topics: Vec<String> = env::var("KAFKA_TOPICS")
             .expect("KAFKA_TOPICS must be set")
             .split(',')
@@ -136,10 +130,9 @@ impl Config {
         .unwrap();
         let commit = env::var("KAFKA_NO_COMMIT").expect("KAFKA_NO_COMMIT must be set");
         let no_commit = commit.eq_ignore_ascii_case("TRUE");
-        let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+        let jwe_secret = env::var("JWE_SECRET").expect("JWE_SECRET must be set");
         Ok(Config {
             fcm_api_key,
-            threadpool_workers,
             topics,
             brokers,
             group,
@@ -150,7 +143,7 @@ impl Config {
             fetch_max_bytes_per_partition,
             retry_max_bytes_limit,
             no_commit,
-            jwt_secret,
+            jwe_secret,
         })
     }
 }
@@ -234,10 +227,11 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
 
     let fcm_client = Arc::new(FirebaseCloudMessaging::new(&config.fcm_api_key));
 
+    let jwe_helper = JWEHelper::new(&config.jwe_secret);
+
     info!("Service started. Listening for events...");
 
     let pool = ThreadPool::new().unwrap();
-    let consumer_config = Arc::new(config.clone());
 
     while !shutdown.load(Ordering::Relaxed) {
         for ms in consumer
@@ -248,60 +242,52 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
             for m in ms.messages() {
                 let connection = connection.clone();
                 let topic = ms.topic().to_owned();
-                let message = String::from_utf8(m.value.to_owned());
-                let config = consumer_config.clone();
                 let fcm_client = fcm_client.clone();
-                pool.spawn_ok(async move {
-                    if let Ok(message) = message {
-                        let jwt_helper = JWTHelper::new(&config.jwt_secret);
-                        if jwt_helper.validate(&message) {
-                            match &topic[..] {
-                                "push-notification" => {
-                                    if let Ok(send_message_data) =
-                                        serde_json::from_str::<SendMessageData>(&message)
-                                    {
-                                        send_messages_to_user(
-                                            connection.clone(),
-                                            fcm_client,
-                                            send_message_data,
-                                        )
-                                        .await;
-                                    } else {
-                                        warn!("Could deserialize data for sending")
-                                    }
+                if let Ok(message) = jwe_helper.decrypt(m.value) {
+                    pool.spawn_ok(async move {
+                        match &topic[..] {
+                            "push-notification" => {
+                                if let Ok(send_message_data) =
+                                    serde_json::from_str::<SendMessageData>(&message)
+                                {
+                                    send_messages_to_user(
+                                        connection.clone(),
+                                        fcm_client,
+                                        send_message_data,
+                                    )
+                                    .await;
+                                } else {
+                                    warn!("Could deserialize data for sending")
                                 }
-                                "create-user-device-mapping" => {
-                                    if let Ok(create_user_data) =
-                                        serde_json::from_str::<CreateUserData>(&message)
-                                    {
-                                        create_user_device_mapping(
-                                            connection.clone(),
-                                            create_user_data,
-                                        )
-                                        .await;
-                                    } else {
-                                        warn!("Could deserialize data to create user mapping")
-                                    }
+                            }
+                            "create-user-device-mapping" => {
+                                if let Ok(create_user_data) =
+                                    serde_json::from_str::<CreateUserData>(&message)
+                                {
+                                    create_user_device_mapping(
+                                        connection.clone(),
+                                        create_user_data,
+                                    )
+                                    .await;
+                                } else {
+                                    warn!("Could deserialize data to create user mapping")
                                 }
-                                "delete-user-device-mapping" => {
-                                    if let Ok(delete_user_data) =
-                                        serde_json::from_str::<DeleteUserData>(&message)
-                                    {
-                                        delete_user_device_mapping(connection, delete_user_data)
-                                            .await;
-                                    } else {
-                                        warn!("Could deserialize data to delete user mapping")
-                                    }
+                            }
+                            "delete-user-device-mapping" => {
+                                if let Ok(delete_user_data) =
+                                    serde_json::from_str::<DeleteUserData>(&message)
+                                {
+                                    delete_user_device_mapping(connection, delete_user_data).await;
+                                } else {
+                                    warn!("Could deserialize data to delete user mapping")
                                 }
-                                unknown => warn!("Cannot handle unknown topic: {}", unknown),
-                            };
-                        } else {
-                            warn!("Invalid jwt");
-                        }
-                    } else {
-                        warn!("Could not decode message");
-                    }
-                });
+                            }
+                            unknown => warn!("Cannot handle unknown topic: {}", unknown),
+                        };
+                    });
+                } else {
+                    warn!("Could not decrypt jwe message");
+                }
             }
             let _ = consumer.consume_messageset(ms);
         }
