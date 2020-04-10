@@ -1,16 +1,9 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-pub enum DeviceType {
-    IOS,
-    FIREBASE, // Can be Android and iOS
-}
-
-#[derive(Debug, Deserialize)]
 pub struct CreateUserData {
     pub user_id: String,
     pub device_token: String,
-    pub device_type: DeviceType,
 }
 
 #[derive(Debug, Deserialize)]

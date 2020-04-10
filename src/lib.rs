@@ -159,39 +159,21 @@ pub async fn create_user_device_mapping<'a>(
     connection: Arc<Mutex<PgConnection>>,
     create_user_data: CreateUserData,
 ) {
-    use db::schema::pdevicetype::dsl::*;
     use db::schema::puser::dsl::*;
 
-    if let Ok(new_devicetype) = pdevicetype
-        .filter(name.eq(match create_user_data.device_type {
-            service::models::DeviceType::FIREBASE => "FIREBASE",
-            service::models::DeviceType::IOS => "IOS",
-        }))
-        .limit(1)
-        .load::<DeviceType>(&*connection.lock().unwrap())
+    let new_user = NewUser {
+        user_id: &create_user_data.user_id,
+        token: &create_user_data.device_token,
+    };
+    match diesel::insert_into(puser)
+        .values(&new_user)
+        .get_result::<User>(&*connection.lock().unwrap())
     {
-        let new_devicetype = &new_devicetype[0]; // B/c limit(1)
-
-        let new_user = NewUser {
-            user_id: &create_user_data.user_id,
-            device_type_id: &new_devicetype.id,
-            token: &create_user_data.device_token,
-        };
-        match diesel::insert_into(puser)
-            .values(&new_user)
-            .get_result::<User>(&*connection.lock().unwrap())
-        {
-            Err(e) => warn!(
-                "Could not create mapping {:?}, b/c: {}",
-                create_user_data, e
-            ),
-            Ok(_) => debug!("Created mapping: {:?}", create_user_data),
-        }
-    } else {
-        warn!(
-            "Could not create mapping, b/c could not retrieve id for device type: {:?}",
-            create_user_data
-        );
+        Err(e) => warn!(
+            "Could not create mapping {:?}, b/c: {}",
+            create_user_data, e
+        ),
+        Ok(_) => debug!("Created mapping: {:?}", create_user_data),
     }
 }
 
@@ -217,29 +199,20 @@ pub async fn send_messages_to_user<'a>(
     send_message_data: SendMessageData,
 ) {
     use db::schema::puser::dsl::*;
-    let users: Result<Vec<(User, DeviceType)>, diesel::result::Error> = db::schema::puser::table
-        .inner_join(db::schema::pdevicetype::table)
+    let users: Result<Vec<User>, diesel::result::Error> = db::schema::puser::table
         .filter(user_id.eq(&send_message_data.user_id))
         .load(&*connection.lock().unwrap());
     if let Ok(users) = users {
         for user in users {
-            match &user.1.name[..] {
-                "FIREBASE" => {
-                    if let Err(e) = fcm_client
-                        .send(
-                            &user.0.token,
-                            &send_message_data.title,
-                            &send_message_data.body,
-                        )
-                        .await
-                    {
-                        warn!("Could not send message {:?}, b/c: {}", send_message_data, e);
-                    }
-                }
-                "IOS" => unimplemented!(),
-                unknown => {
-                    warn!("Could not send message {:?}, b/c no action to send message for device type: {}", send_message_data, unknown);
-                }
+            if let Err(e) = fcm_client
+                .send(
+                    &user.token,
+                    &send_message_data.title,
+                    &send_message_data.body,
+                )
+                .await
+            {
+                warn!("Could not send message {:?}, b/c: {}", send_message_data, e);
             }
         }
     } else {
