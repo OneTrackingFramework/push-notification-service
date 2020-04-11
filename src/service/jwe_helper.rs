@@ -23,13 +23,11 @@ impl JWEHelper {
             encrypted_payload,
         )?);
 
-        let decrypted_jwe = encrypted_jwe
-            .decrypt(
-                &key,
-                KeyManagementAlgorithm::DirectSymmetricKey,
-                ContentEncryptionAlgorithm::A128GCM,
-            )
-            .unwrap();
+        let decrypted_jwe = encrypted_jwe.decrypt(
+            &key,
+            KeyManagementAlgorithm::DirectSymmetricKey,
+            ContentEncryptionAlgorithm::A128GCM,
+        )?;
         let decrypted_payload: &Vec<u8> = decrypted_jwe.payload()?;
         Ok(String::from_utf8((*decrypted_payload.to_owned()).to_vec())?)
     }
