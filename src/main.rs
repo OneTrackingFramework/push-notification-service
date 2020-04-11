@@ -12,7 +12,8 @@ use std::sync::{
 
 use pushy::*;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let handler_shutdown = shutdown.clone();
     ctrlc::set_handler(move || {

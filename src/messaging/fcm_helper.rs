@@ -22,7 +22,7 @@ impl MessagingClient for FirebaseCloudMessaging {
         message_builder.notification(notification);
 
         let response = self.client.send(message_builder.finalize()).await?;
-        info!("FCM client send: {:?}", response);
+        debug!("FCM client send: {:?}", response);
         Ok(())
     }
 }

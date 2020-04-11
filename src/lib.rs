@@ -26,8 +26,6 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use futures::executor::ThreadPool;
-
 use service::jwe_helper::JWEHelper;
 use service::models::{CreateUserData, DeleteUserData, SendMessageData};
 
@@ -231,8 +229,6 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
 
     info!("Service started. Listening for events...");
 
-    let pool = ThreadPool::new().unwrap();
-
     while !shutdown.load(Ordering::Relaxed) {
         for ms in consumer
             .poll()
@@ -246,7 +242,7 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                 let connection = connection.clone();
                 let fcm_client = fcm_client.clone();
                 let jwe_helper = jwe_helper.clone();
-                pool.spawn_ok(async move {
+                tokio::spawn(async move {
                     if let Ok(message) = jwe_helper.decrypt(&token) {
                         match &topic[..] {
                             "push-notification" => {
