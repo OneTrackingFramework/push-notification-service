@@ -227,7 +227,7 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
 
     let fcm_client = Arc::new(FirebaseCloudMessaging::new(&config.fcm_api_key));
 
-    let jwe_helper = JWEHelper::new(&config.jwe_secret);
+    let jwe_helper = Arc::new(JWEHelper::new(&config.jwe_secret));
 
     info!("Service started. Listening for events...");
 
@@ -240,11 +240,14 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
             .iter()
         {
             for m in ms.messages() {
-                let connection = connection.clone();
                 let topic = ms.topic().to_owned();
+                let token = m.value.to_owned();
+
+                let connection = connection.clone();
                 let fcm_client = fcm_client.clone();
-                if let Ok(message) = jwe_helper.decrypt(m.value) {
-                    pool.spawn_ok(async move {
+                let jwe_helper = jwe_helper.clone();
+                pool.spawn_ok(async move {
+                    if let Ok(message) = jwe_helper.decrypt(&token) {
                         match &topic[..] {
                             "push-notification" => {
                                 if let Ok(send_message_data) =
@@ -284,10 +287,10 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                             }
                             unknown => warn!("Cannot handle unknown topic: {}", unknown),
                         };
-                    });
-                } else {
-                    warn!("Could not decrypt jwe message");
-                }
+                    } else {
+                        warn!("Could not decrypt jwe message");
+                    }
+                });
             }
             let _ = consumer.consume_messageset(ms);
         }

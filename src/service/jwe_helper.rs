@@ -1,7 +1,5 @@
 extern crate biscuit;
 
-use std::error::Error;
-
 use biscuit::jwa::{ContentEncryptionAlgorithm, KeyManagementAlgorithm};
 use biscuit::jwe::Compact;
 use biscuit::jwk::JWK;
@@ -17,11 +15,10 @@ impl JWEHelper {
             secret: base64::decode(secret.to_owned()).unwrap(),
         }
     }
-    pub fn decrypt(&self, encrypted_payload: &[u8]) -> Result<String, Box<dyn Error>> {
+    pub fn decrypt(&self, token: &[u8]) -> Result<String, biscuit::errors::Error> {
         let key: JWK<Empty> = JWK::new_octet_key(self.secret.as_slice(), Default::default());
-        let encrypted_jwe = Compact::<Vec<u8>, biscuit::Empty>::new_encrypted(std::str::from_utf8(
-            encrypted_payload,
-        )?);
+        let encrypted_jwe =
+            Compact::<Vec<u8>, biscuit::Empty>::new_encrypted(std::str::from_utf8(token)?);
 
         let decrypted_jwe = encrypted_jwe.decrypt(
             &key,
