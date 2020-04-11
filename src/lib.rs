@@ -10,6 +10,7 @@ extern crate dotenv;
 use db::models::*;
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
+use diesel::r2d2::{ConnectionManager, Pool};
 
 extern crate kafka;
 use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
@@ -22,7 +23,7 @@ use std::env;
 use std::error::Error;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::time::Duration;
 
@@ -34,12 +35,17 @@ use messaging::fcm_helper::FirebaseCloudMessaging;
 
 embed_migrations!("./migrations");
 
-fn establish_connection() -> PgConnection {
+type PgPool = Pool<ConnectionManager<PgConnection>>;
+
+fn establish_db_connection() -> PgPool {
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let connection = PgConnection::establish(&database_url)
-        .unwrap_or_else(|_| panic!("Error connecting to {}", database_url));
-    info!("Established database connection");
-    connection
+    let manager = ConnectionManager::<PgConnection>::new(&database_url);
+    let pool = Pool::builder()
+        .max_size(15)
+        .build(manager)
+        .expect("Failed to create database pool");
+    info!("Created new database pool");
+    pool
 }
 
 fn create_kafka_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
@@ -146,10 +152,7 @@ impl Config {
     }
 }
 
-pub async fn create_user_device_mapping<'a>(
-    connection: Arc<Mutex<PgConnection>>,
-    create_user_data: CreateUserData,
-) {
+pub async fn create_user_device_mapping<'a>(db_pool: PgPool, create_user_data: CreateUserData) {
     use db::schema::puser::dsl::*;
 
     let new_user = NewUser {
@@ -158,7 +161,7 @@ pub async fn create_user_device_mapping<'a>(
     };
     match diesel::insert_into(puser)
         .values(&new_user)
-        .get_result::<User>(&*connection.lock().unwrap())
+        .get_result::<User>(&db_pool.get().unwrap())
     {
         Err(e) => warn!(
             "Could not create mapping {:?}, b/c: {}",
@@ -168,14 +171,11 @@ pub async fn create_user_device_mapping<'a>(
     }
 }
 
-pub async fn delete_user_device_mapping<'a>(
-    connection: Arc<Mutex<PgConnection>>,
-    delete_user_data: DeleteUserData,
-) {
+pub async fn delete_user_device_mapping<'a>(db_pool: PgPool, delete_user_data: DeleteUserData) {
     use db::schema::puser::dsl::*;
 
     if diesel::delete(puser.filter(token.eq(&delete_user_data.devie_token)))
-        .execute(&*connection.lock().unwrap())
+        .execute(&db_pool.get().unwrap())
         .is_ok()
     {
         debug!("Deleted mapping: {:?}", delete_user_data);
@@ -185,14 +185,14 @@ pub async fn delete_user_device_mapping<'a>(
 }
 
 pub async fn send_messages_to_user<'a>(
-    connection: Arc<Mutex<PgConnection>>,
+    db_pool: PgPool,
     fcm_client: Arc<FirebaseCloudMessaging>,
     send_message_data: SendMessageData,
 ) {
     use db::schema::puser::dsl::*;
     let users: Result<Vec<User>, diesel::result::Error> = db::schema::puser::table
         .filter(user_id.eq(&send_message_data.user_id))
-        .load(&*connection.lock().unwrap());
+        .load(&db_pool.get().unwrap());
     if let Ok(users) = users {
         for user in users {
             if let Err(e) = fcm_client
@@ -215,10 +215,10 @@ pub async fn send_messages_to_user<'a>(
 }
 
 pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
-    let connection = Arc::new(Mutex::new(establish_connection()));
+    let db_pool = establish_db_connection();
 
     // Do db migrations
-    embedded_migrations::run(&*connection.lock().unwrap())?;
+    embedded_migrations::run(&db_pool.get().unwrap())?;
     info!("Database migrations completed");
 
     let mut consumer = create_kafka_consumer(config.clone()).unwrap();
@@ -239,7 +239,7 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                 let topic = ms.topic().to_owned();
                 let token = m.value.to_owned();
 
-                let connection = connection.clone();
+                let db_pool = db_pool.clone();
                 let fcm_client = fcm_client.clone();
                 let jwe_helper = jwe_helper.clone();
                 tokio::spawn(async move {
@@ -249,12 +249,8 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                                 if let Ok(send_message_data) =
                                     serde_json::from_str::<SendMessageData>(&message)
                                 {
-                                    send_messages_to_user(
-                                        connection.clone(),
-                                        fcm_client,
-                                        send_message_data,
-                                    )
-                                    .await;
+                                    send_messages_to_user(db_pool, fcm_client, send_message_data)
+                                        .await;
                                 } else {
                                     warn!("Could deserialize data for sending")
                                 }
@@ -263,11 +259,7 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                                 if let Ok(create_user_data) =
                                     serde_json::from_str::<CreateUserData>(&message)
                                 {
-                                    create_user_device_mapping(
-                                        connection.clone(),
-                                        create_user_data,
-                                    )
-                                    .await;
+                                    create_user_device_mapping(db_pool, create_user_data).await;
                                 } else {
                                     warn!("Could deserialize data to create user mapping")
                                 }
@@ -276,7 +268,7 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                                 if let Ok(delete_user_data) =
                                     serde_json::from_str::<DeleteUserData>(&message)
                                 {
-                                    delete_user_device_mapping(connection, delete_user_data).await;
+                                    delete_user_device_mapping(db_pool, delete_user_data).await;
                                 } else {
                                     warn!("Could deserialize data to delete user mapping")
                                 }
