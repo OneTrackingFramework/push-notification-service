@@ -242,40 +242,48 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
                 let fcm_client = fcm_client.clone();
                 let jwe_helper = jwe_helper.clone();
                 tokio::spawn(async move {
-                    if let Ok(message) = jwe_helper.decrypt(&token) {
-                        match &topic[..] {
-                            "push-notification" => {
-                                if let Ok(send_message_data) =
-                                    serde_json::from_str::<SendMessageData>(&message)
-                                {
-                                    send_messages_to_user(db_pool, fcm_client, send_message_data)
+                    if let Ok(token) = String::from_utf8(token) {
+                        if let Ok(message) = jwe_helper.decrypt(&token) {
+                            match &topic[..] {
+                                "push-notification" => {
+                                    if let Ok(send_message_data) =
+                                        serde_json::from_str::<SendMessageData>(&message)
+                                    {
+                                        send_messages_to_user(
+                                            db_pool,
+                                            fcm_client,
+                                            send_message_data,
+                                        )
                                         .await;
-                                } else {
-                                    warn!("Could deserialize data for sending")
+                                    } else {
+                                        warn!("Could deserialize data for sending")
+                                    }
                                 }
-                            }
-                            "create-user-device-mapping" => {
-                                if let Ok(create_user_data) =
-                                    serde_json::from_str::<CreateUserData>(&message)
-                                {
-                                    create_user_device_mapping(db_pool, create_user_data).await;
-                                } else {
-                                    warn!("Could deserialize data to create user mapping")
+                                "create-user-device-mapping" => {
+                                    if let Ok(create_user_data) =
+                                        serde_json::from_str::<CreateUserData>(&message)
+                                    {
+                                        create_user_device_mapping(db_pool, create_user_data).await;
+                                    } else {
+                                        warn!("Could deserialize data to create user mapping")
+                                    }
                                 }
-                            }
-                            "delete-user-device-mapping" => {
-                                if let Ok(delete_user_data) =
-                                    serde_json::from_str::<DeleteUserData>(&message)
-                                {
-                                    delete_user_device_mapping(db_pool, delete_user_data).await;
-                                } else {
-                                    warn!("Could deserialize data to delete user mapping")
+                                "delete-user-device-mapping" => {
+                                    if let Ok(delete_user_data) =
+                                        serde_json::from_str::<DeleteUserData>(&message)
+                                    {
+                                        delete_user_device_mapping(db_pool, delete_user_data).await;
+                                    } else {
+                                        warn!("Could deserialize data to delete user mapping")
+                                    }
                                 }
-                            }
-                            unknown => warn!("Cannot handle unknown topic: {}", unknown),
-                        };
+                                unknown => warn!("Cannot handle unknown topic: {}", unknown),
+                            };
+                        } else {
+                            warn!("Could not decrypt jwe message");
+                        }
                     } else {
-                        warn!("Could not decrypt jwe message");
+                        warn!("JWE token does not contain valid UTF-8")
                     }
                 });
             }
