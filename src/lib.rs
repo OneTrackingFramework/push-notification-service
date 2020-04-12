@@ -173,7 +173,7 @@ pub async fn create_user_device_mapping<'a>(db_pool: PgPool, create_user_data: C
 pub async fn delete_user_device_mapping<'a>(db_pool: PgPool, delete_user_data: DeleteUserData) {
     use db::schema::puser::dsl::*;
 
-    if diesel::delete(puser.filter(token.eq(&delete_user_data.devie_token)))
+    if diesel::delete(puser.filter(token.eq(&delete_user_data.device_token)))
         .execute(&db_pool.get().unwrap())
         .is_ok()
     {
