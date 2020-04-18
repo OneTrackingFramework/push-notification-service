@@ -160,7 +160,7 @@ impl Config {
 
 macro_rules! handle_topic {
     ($topic: ident, $ms: expr) => {
-        if $ms.topic().eq(stringify!(ident)) {
+        if $ms.topic().eq(stringify!($topic)) {
             for message in $ms.messages() {
                 let message = message.value.to_vec();
                 tokio::spawn(async move {
@@ -174,6 +174,9 @@ macro_rules! handle_topic {
                     }
                 });
             }
+            true
+        } else {
+            false
         }
     };
 }
@@ -194,9 +197,9 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Error> {
             .expect("Failed to poll from Kafka consumer")
             .iter()
         {
-            handle_topic!(push_notification, ms);
-            handle_topic!(create_user_device_mapping, ms);
-            handle_topic!(delete_user_device_mapping, ms);
+            let _ = handle_topic!(push_notification, ms)
+                || handle_topic!(create_user_device_mapping, ms)
+                || handle_topic!(delete_user_device_mapping, ms);
             let _ = consumer.consume_messageset(ms);
         }
         if !no_commit {
