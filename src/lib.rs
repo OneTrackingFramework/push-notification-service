@@ -2,42 +2,39 @@
 extern crate log;
 extern crate env_logger;
 
+extern crate dotenv;
 #[macro_use]
 extern crate diesel;
-#[macro_use]
-extern crate diesel_migrations;
-extern crate dotenv;
-use db::models::*;
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
 
+#[macro_use]
+extern crate diesel_migrations;
+
 extern crate kafka;
 use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
+use std::time::Duration;
 
 mod db;
-mod messaging;
-mod service;
+mod endpoints;
+use endpoints::*;
 
 use std::env;
-use std::error::Error;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Duration;
 
-use service::jwe_helper::JWEHelper;
-use service::models::{CreateUserData, DeleteUserData, SendMessageData};
-
-use messaging::client::MessagingClient;
-use messaging::fcm_helper::FirebaseCloudMessaging;
+use once_cell::sync::Lazy;
 
 embed_migrations!("./migrations");
 
+type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 type PgPool = Pool<ConnectionManager<PgConnection>>;
 
-fn establish_db_connection() -> PgPool {
+static DBPOOL: Lazy<PgPool> = Lazy::new(|| {
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let manager = ConnectionManager::<PgConnection>::new(&database_url);
     let pool = Pool::builder()
@@ -45,9 +42,25 @@ fn establish_db_connection() -> PgPool {
         .expect("Failed to create database pool");
     info!("Created new database pool");
     pool
+});
+
+struct FCMHelper {
+    client: fcm::Client,
+    api_key: String,
 }
 
-fn create_kafka_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
+impl Default for FCMHelper {
+    fn default() -> FCMHelper {
+        FCMHelper {
+            client: fcm::Client::new(),
+            api_key: env::var("FCM_API_KEY").expect("FCM_API_KEY must be set"),
+        }
+    }
+}
+
+static FCMHELPER: Lazy<FCMHelper> = Lazy::new(FCMHelper::default);
+
+fn create_kafka_consumer(config: Config) -> Result<Consumer, kafka::Error> {
     let mut cb = Consumer::from_hosts(config.brokers)
         .with_group(config.group)
         .with_fallback_offset(config.fallback_offset)
@@ -63,9 +76,7 @@ fn create_kafka_consumer(config: Config) -> Result<Consumer, Box<dyn Error>> {
     Ok(cb.create()?)
 }
 
-#[derive(Clone)]
 pub struct Config {
-    fcm_api_key: String,
     topics: Vec<String>,
     brokers: Vec<String>,
     group: String,
@@ -76,7 +87,6 @@ pub struct Config {
     fetch_max_bytes_per_partition: i32,
     retry_max_bytes_limit: i32,
     no_commit: bool,
-    jwe_secret: String,
 }
 
 impl Config {
@@ -84,7 +94,6 @@ impl Config {
         if args.is_empty() {
             return Err("not enough arguments");
         }
-        let fcm_api_key = env::var("FCM_API_KEY").expect("FCM_API_KEY must be set");
         let topics: Vec<String> = env::var("KAFKA_TOPICS")
             .expect("KAFKA_TOPICS must be set")
             .split(',')
@@ -133,9 +142,8 @@ impl Config {
         .unwrap();
         let commit = env::var("KAFKA_NO_COMMIT").expect("KAFKA_NO_COMMIT must be set");
         let no_commit = commit.eq_ignore_ascii_case("TRUE");
-        let jwe_secret = env::var("JWE_SECRET").expect("JWE_SECRET must be set");
+
         Ok(Config {
-            fcm_api_key,
             topics,
             brokers,
             group,
@@ -146,85 +154,37 @@ impl Config {
             fetch_max_bytes_per_partition,
             retry_max_bytes_limit,
             no_commit,
-            jwe_secret,
         })
     }
 }
 
-pub async fn create_user_device_mapping<'a>(db_pool: PgPool, create_user_data: CreateUserData) {
-    use db::schema::puser::dsl::*;
-
-    let new_user = NewUser {
-        user_id: &create_user_data.user_id,
-        token: &create_user_data.device_token,
-    };
-    match diesel::insert_into(puser)
-        .values(&new_user)
-        .get_result::<User>(&db_pool.get().unwrap())
-    {
-        Err(e) => warn!(
-            "Could not create mapping {:?}, b/c: {}",
-            create_user_data, e
-        ),
-        Ok(_) => debug!("Created mapping: {:?}", create_user_data),
-    }
-}
-
-pub async fn delete_user_device_mapping<'a>(db_pool: PgPool, delete_user_data: DeleteUserData) {
-    use db::schema::puser::dsl::*;
-
-    if diesel::delete(puser.filter(token.eq(&delete_user_data.device_token)))
-        .execute(&db_pool.get().unwrap())
-        .is_ok()
-    {
-        debug!("Deleted mapping: {:?}", delete_user_data);
-    } else {
-        warn! {"Could not delete mapping: {:?}", delete_user_data};
-    }
-}
-
-pub async fn send_messages_to_user<'a>(
-    db_pool: PgPool,
-    fcm_client: Arc<FirebaseCloudMessaging>,
-    send_message_data: SendMessageData,
-) {
-    use db::schema::puser::dsl::*;
-    let users: Result<Vec<User>, diesel::result::Error> = db::schema::puser::table
-        .filter(user_id.eq(&send_message_data.user_id))
-        .load(&db_pool.get().unwrap());
-    if let Ok(users) = users {
-        for user in users {
-            if let Err(e) = fcm_client
-                .send(
-                    &user.token,
-                    &send_message_data.title,
-                    &send_message_data.body,
-                )
-                .await
-            {
-                warn!("Could not send message {:?}, b/c: {}", send_message_data, e);
+macro_rules! handle_topic {
+    ($topic: ident, $ms: expr) => {
+        if $ms.topic().eq(stringify!(ident)) {
+            for message in $ms.messages() {
+                let message = message.value.to_vec();
+                tokio::spawn(async move {
+                    match serde_json::from_slice::<$topic::Req>(message.as_slice()) {
+                        Ok(req) => {
+                            if let Err(e) = req.handle().await {
+                                warn!("Could not handle request: {}", e);
+                            }
+                        }
+                        Err(e) => warn!("Could not deserialize kafka message: {}", e),
+                    }
+                });
             }
         }
-    } else {
-        warn!(
-            "Could not send message {:?}, b/c could not retrieve user from database",
-            send_message_data
-        );
-    }
+    };
 }
 
-pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
-    let db_pool = establish_db_connection();
-
+pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Error> {
     // Do db migrations
-    embedded_migrations::run(&db_pool.get().unwrap())?;
+    embedded_migrations::run(&DBPOOL.get().unwrap())?;
     info!("Database migrations completed");
 
-    let mut consumer = create_kafka_consumer(config.clone()).unwrap();
-
-    let fcm_client = Arc::new(FirebaseCloudMessaging::new(&config.fcm_api_key));
-
-    let jwe_helper = Arc::new(JWEHelper::new(&config.jwe_secret));
+    let no_commit = config.no_commit;
+    let mut consumer = create_kafka_consumer(config).unwrap();
 
     info!("Service started. Listening for events...");
 
@@ -234,62 +194,12 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<(), Box<dyn Erro
             .expect("Failed to poll from Kafka consumer")
             .iter()
         {
-            for m in ms.messages() {
-                let topic = ms.topic().to_owned();
-                let token = m.value.to_owned();
-
-                let db_pool = db_pool.clone();
-                let fcm_client = fcm_client.clone();
-                let jwe_helper = jwe_helper.clone();
-                tokio::spawn(async move {
-                    if let Ok(token) = String::from_utf8(token) {
-                        if let Ok(message) = jwe_helper.decrypt(&token) {
-                            match &topic[..] {
-                                "push-notification" => {
-                                    if let Ok(send_message_data) =
-                                        serde_json::from_str::<SendMessageData>(&message)
-                                    {
-                                        send_messages_to_user(
-                                            db_pool,
-                                            fcm_client,
-                                            send_message_data,
-                                        )
-                                        .await;
-                                    } else {
-                                        warn!("Could deserialize data for sending")
-                                    }
-                                }
-                                "create-user-device-mapping" => {
-                                    if let Ok(create_user_data) =
-                                        serde_json::from_str::<CreateUserData>(&message)
-                                    {
-                                        create_user_device_mapping(db_pool, create_user_data).await;
-                                    } else {
-                                        warn!("Could deserialize data to create user mapping")
-                                    }
-                                }
-                                "delete-user-device-mapping" => {
-                                    if let Ok(delete_user_data) =
-                                        serde_json::from_str::<DeleteUserData>(&message)
-                                    {
-                                        delete_user_device_mapping(db_pool, delete_user_data).await;
-                                    } else {
-                                        warn!("Could deserialize data to delete user mapping")
-                                    }
-                                }
-                                unknown => warn!("Cannot handle unknown topic: {}", unknown),
-                            };
-                        } else {
-                            warn!("Could not decrypt jwe message");
-                        }
-                    } else {
-                        warn!("JWE token does not contain valid UTF-8")
-                    }
-                });
-            }
+            handle_topic!(push_notification, ms);
+            handle_topic!(create_user_device_mapping, ms);
+            handle_topic!(delete_user_device_mapping, ms);
             let _ = consumer.consume_messageset(ms);
         }
-        if !config.no_commit {
+        if !no_commit {
             consumer
                 .commit_consumed()
                 .expect("Failed to commit consumed message");
